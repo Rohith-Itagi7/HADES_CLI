@@ -282,13 +282,13 @@ impl Drop for StdioTransport {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct SseEvent {
-    event_type: String,
-    data: String,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseEvent {
+    pub event_type: String,
+    pub data: String,
 }
 
-fn parse_sse_event(frame: &str) -> Result<Option<SseEvent>, McpError> {
+pub fn parse_sse_event(frame: &str) -> Result<Option<SseEvent>, McpError> {
     let mut event_type = None;
     let mut data = Vec::new();
 
@@ -318,7 +318,52 @@ fn parse_sse_event(frame: &str) -> Result<Option<SseEvent>, McpError> {
     }))
 }
 
-fn endpoint_from_sse_event(event: &SseEvent) -> Result<Option<String>, McpError> {
+/// Finds the boundary and delimiter length of the next complete SSE frame in a byte buffer.
+pub fn next_sse_frame(buffer: &[u8]) -> Option<(usize, usize)> {
+    let rn_pos = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    let n_pos = buffer.windows(2).position(|window| window == b"\n\n");
+
+    match (rn_pos, n_pos) {
+        (Some(rn), Some(n)) => {
+            if rn <= n {
+                Some((rn, 4))
+            } else {
+                Some((n, 2))
+            }
+        }
+        (Some(rn), None) => Some((rn, 4)),
+        (None, Some(n)) => Some((n, 2)),
+        (None, None) => None,
+    }
+}
+
+/// Parses a JSON-RPC response from event data, matching against `target_id`.
+pub fn parse_json_rpc_response_from_data(data: &str, target_id: &str) -> Option<JsonRpcResponse> {
+    let trimmed = data.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(trimmed) {
+        let resp_id = json_rpc_id(&resp.id);
+        if resp_id == target_id || (resp.error.is_some() && resp.id.is_null()) {
+            return Some(resp);
+        }
+    }
+
+    if let Ok(batch) = serde_json::from_str::<Vec<JsonRpcResponse>>(trimmed) {
+        for resp in batch {
+            let resp_id = json_rpc_id(&resp.id);
+            if resp_id == target_id || (resp.error.is_some() && resp.id.is_null()) {
+                return Some(resp);
+            }
+        }
+    }
+
+    None
+}
+
+pub fn endpoint_from_sse_event(event: &SseEvent) -> Result<Option<String>, McpError> {
     if event.event_type != "endpoint" {
         return Ok(None);
     }
@@ -332,14 +377,14 @@ fn endpoint_from_sse_event(event: &SseEvent) -> Result<Option<String>, McpError>
     Ok(Some(endpoint.to_string()))
 }
 
-fn response_from_sse_event(event: &SseEvent) -> Result<Option<JsonRpcResponse>, McpError> {
+pub fn response_from_sse_event(event: &SseEvent) -> Result<Option<JsonRpcResponse>, McpError> {
     if event.event_type != "message" {
         return Ok(None);
     }
     Ok(Some(serde_json::from_str(&event.data)?))
 }
 
-async fn route_sse_response(
+pub async fn route_sse_response(
     pending_requests: &RwLock<HashMap<String, oneshot::Sender<JsonRpcResponse>>>,
     response: JsonRpcResponse,
 ) -> bool {
@@ -352,7 +397,7 @@ async fn route_sse_response(
     }
 }
 
-fn json_rpc_id(id: &serde_json::Value) -> String {
+pub fn json_rpc_id(id: &serde_json::Value) -> String {
     match id {
         serde_json::Value::String(value) => value.clone(),
         serde_json::Value::Number(value) => value.to_string(),
@@ -467,9 +512,9 @@ impl SseTransport {
                 };
                 buffer.extend_from_slice(&chunk);
 
-                while let Some(end) = sse_frame_end(&buffer) {
+                while let Some((end, delim_len)) = next_sse_frame(&buffer) {
                     let frame: Vec<u8> = buffer.drain(..end).collect();
-                    buffer.drain(..sse_delimiter_len(&buffer));
+                    buffer.drain(..delim_len);
                     let frame = match String::from_utf8(frame) {
                         Ok(frame) => frame,
                         Err(error) => {
@@ -555,21 +600,6 @@ impl SseTransport {
     }
 }
 
-fn sse_frame_end(buffer: &[u8]) -> Option<usize> {
-    buffer
-        .windows(2)
-        .position(|window| window == b"\n\n")
-        .or_else(|| buffer.windows(4).position(|window| window == b"\r\n\r\n"))
-}
-
-fn sse_delimiter_len(buffer: &[u8]) -> usize {
-    if buffer.starts_with(b"\r\n\r\n") {
-        4
-    } else {
-        2
-    }
-}
-
 #[async_trait]
 impl McpTransport for SseTransport {
     async fn send_request(
@@ -629,12 +659,18 @@ impl McpTransport for SseTransport {
     }
 }
 
-/// HTTP JSON-RPC 2.0 Transport for remote MCP servers.
+/// HTTP / Streamable HTTP Transport for remote MCP servers.
+///
+/// Implements the modern MCP Streamable HTTP specification.
+/// Supports both `application/json` (direct JSON-RPC responses) and
+/// `text/event-stream` (SSE-framed JSON-RPC responses), streaming chunked
+/// frames, session ID tracking (`mcp-session-id`), and request ID routing.
 pub struct HttpTransport {
     server_name: String,
     endpoint_url: String,
     client: reqwest::Client,
     headers: HashMap<String, String>,
+    session_id: Arc<RwLock<Option<String>>>,
     is_running: Arc<AtomicBool>,
     request_counter: AtomicU64,
 }
@@ -650,15 +686,205 @@ impl HttpTransport {
             endpoint_url: endpoint_url.into(),
             client: reqwest::Client::builder().build().unwrap_or_default(),
             headers,
+            session_id: Arc::new(RwLock::new(None)),
             is_running: Arc::new(AtomicBool::new(true)),
             request_counter: AtomicU64::new(1),
         }
     }
 
+    /// Allocates an incremental request ID.
     pub fn next_request_id(&self) -> String {
         self.request_counter
             .fetch_add(1, Ordering::SeqCst)
             .to_string()
+    }
+
+    /// Returns the active session ID, if negotiated.
+    pub async fn session_id(&self) -> Option<String> {
+        self.session_id.read().await.clone()
+    }
+
+    /// Explicitly sets or overrides the session ID.
+    pub async fn set_session_id(&self, id: Option<String>) {
+        *self.session_id.write().await = id;
+    }
+
+    async fn decode_json_response(
+        resp: reqwest::Response,
+        target_id: &str,
+        server_name: &str,
+    ) -> Result<JsonRpcResponse, McpError> {
+        let body_bytes = resp.bytes().await.map_err(|e| {
+            McpError::Transport(format!(
+                "Failed to read response body from '{server_name}': {e}"
+            ))
+        })?;
+
+        if let Ok(json_rpc_resp) = serde_json::from_slice::<JsonRpcResponse>(&body_bytes) {
+            let resp_id = json_rpc_id(&json_rpc_resp.id);
+            if resp_id == target_id || (json_rpc_resp.error.is_some() && json_rpc_resp.id.is_null())
+            {
+                return Ok(json_rpc_resp);
+            }
+        }
+
+        if let Ok(batch) = serde_json::from_slice::<Vec<JsonRpcResponse>>(&body_bytes) {
+            for resp in batch {
+                let resp_id = json_rpc_id(&resp.id);
+                if resp_id == target_id || (resp.error.is_some() && resp.id.is_null()) {
+                    return Ok(resp);
+                }
+            }
+        }
+
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        if body_str.contains("event:") || body_str.contains("data:") {
+            if let Some(resp) = Self::decode_sse_from_text(&body_str, target_id) {
+                return Ok(resp);
+            }
+        }
+
+        let preview = if body_str.len() > 200 {
+            format!("{}...", &body_str[..200])
+        } else {
+            body_str.to_string()
+        };
+        Err(McpError::Transport(format!(
+            "Failed to parse HTTP JSON-RPC response from server '{server_name}': {preview}"
+        )))
+    }
+
+    fn decode_inferred_response(
+        bytes: &[u8],
+        target_id: &str,
+        server_name: &str,
+    ) -> Result<JsonRpcResponse, McpError> {
+        if let Ok(json_rpc_resp) = serde_json::from_slice::<JsonRpcResponse>(bytes) {
+            let resp_id = json_rpc_id(&json_rpc_resp.id);
+            if resp_id == target_id || (json_rpc_resp.error.is_some() && json_rpc_resp.id.is_null())
+            {
+                return Ok(json_rpc_resp);
+            }
+        }
+
+        if let Ok(batch) = serde_json::from_slice::<Vec<JsonRpcResponse>>(bytes) {
+            for resp in batch {
+                let resp_id = json_rpc_id(&resp.id);
+                if resp_id == target_id || (resp.error.is_some() && resp.id.is_null()) {
+                    return Ok(resp);
+                }
+            }
+        }
+
+        let text = String::from_utf8_lossy(bytes);
+        if let Some(resp) = Self::decode_sse_from_text(&text, target_id) {
+            return Ok(resp);
+        }
+
+        Err(McpError::Transport(format!(
+            "Failed to parse response body from server '{server_name}'"
+        )))
+    }
+
+    pub fn decode_sse_from_text(text: &str, target_id: &str) -> Option<JsonRpcResponse> {
+        let mut buffer = text.as_bytes().to_vec();
+        while let Some((end, delim_len)) = next_sse_frame(&buffer) {
+            let frame_bytes: Vec<u8> = buffer.drain(..end).collect();
+            buffer.drain(..delim_len);
+            if let Ok(frame_str) = String::from_utf8(frame_bytes) {
+                if let Ok(Some(event)) = parse_sse_event(&frame_str) {
+                    if event.event_type == "message" || event.event_type.is_empty() {
+                        if let Some(resp) =
+                            parse_json_rpc_response_from_data(&event.data, target_id)
+                        {
+                            return Some(resp);
+                        }
+                    }
+                }
+            }
+        }
+        if !buffer.is_empty() {
+            if let Ok(frame_str) = String::from_utf8(buffer) {
+                if let Ok(Some(event)) = parse_sse_event(&frame_str) {
+                    if event.event_type == "message" || event.event_type.is_empty() {
+                        if let Some(resp) =
+                            parse_json_rpc_response_from_data(&event.data, target_id)
+                        {
+                            return Some(resp);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    async fn decode_sse_response_stream<S, B, E>(
+        mut stream: S,
+        target_id: &str,
+        server_name: &str,
+    ) -> Result<JsonRpcResponse, McpError>
+    where
+        S: futures::Stream<Item = Result<B, E>> + Unpin,
+        B: AsRef<[u8]>,
+        E: std::fmt::Display,
+    {
+        let mut buffer = Vec::new();
+
+        while let Some(chunk_res) = stream.next().await {
+            let chunk = chunk_res.map_err(|e| {
+                McpError::Transport(format!(
+                    "Error reading SSE response stream from '{server_name}': {e}"
+                ))
+            })?;
+            buffer.extend_from_slice(chunk.as_ref());
+
+            while let Some((end, delim_len)) = next_sse_frame(&buffer) {
+                let frame_bytes: Vec<u8> = buffer.drain(..end).collect();
+                buffer.drain(..delim_len);
+
+                let frame_str = match String::from_utf8(frame_bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        debug!(server = %server_name, error = %e, "Invalid UTF-8 in SSE frame");
+                        continue;
+                    }
+                };
+
+                let event = match parse_sse_event(&frame_str) {
+                    Ok(Some(ev)) => ev,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        debug!(server = %server_name, error = %e, "Malformed SSE frame");
+                        continue;
+                    }
+                };
+
+                if event.event_type == "message" || event.event_type.is_empty() {
+                    if let Some(resp) = parse_json_rpc_response_from_data(&event.data, target_id) {
+                        return Ok(resp);
+                    }
+                }
+            }
+        }
+
+        if !buffer.is_empty() {
+            if let Ok(frame_str) = String::from_utf8(buffer) {
+                if let Ok(Some(event)) = parse_sse_event(&frame_str) {
+                    if event.event_type == "message" || event.event_type.is_empty() {
+                        if let Some(resp) =
+                            parse_json_rpc_response_from_data(&event.data, target_id)
+                        {
+                            return Ok(resp);
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(McpError::Protocol(format!(
+            "No matching JSON-RPC response found for request ID '{target_id}' in SSE stream from server '{server_name}'"
+        )))
     }
 }
 
@@ -676,15 +902,21 @@ impl McpTransport for HttpTransport {
         if request.id.is_null() {
             request.id = serde_json::Value::String(self.next_request_id());
         }
+        let target_id = json_rpc_id(&request.id);
 
         let mut req_builder = self
             .client
             .post(&self.endpoint_url)
             .timeout(timeout_dur)
+            .header("Accept", "application/json, text/event-stream")
             .json(&request);
 
         for (k, v) in &self.headers {
             req_builder = req_builder.header(k, v);
+        }
+
+        if let Some(session_id) = self.session_id.read().await.as_ref() {
+            req_builder = req_builder.header("mcp-session-id", session_id);
         }
 
         let resp = req_builder
@@ -692,28 +924,83 @@ impl McpTransport for HttpTransport {
             .await
             .map_err(|e| McpError::Transport(format!("HTTP request failed: {e}")))?;
 
-        if !resp.status().is_success() {
+        if let Some(session_header) = resp.headers().get("mcp-session-id") {
+            if let Ok(val) = session_header.to_str() {
+                let mut sid = self.session_id.write().await;
+                *sid = Some(val.to_string());
+            }
+        }
+
+        let status = resp.status();
+        if !status.is_success() {
+            let error_text = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
             return Err(McpError::Transport(format!(
-                "HTTP server returned status {}",
-                resp.status()
+                "HTTP server returned status {status}: {error_text}"
             )));
         }
 
-        let json_rpc_resp: JsonRpcResponse = resp.json().await.map_err(|e| {
-            McpError::Transport(format!("Failed to parse HTTP JSON-RPC response: {e}"))
-        })?;
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
 
-        Ok(json_rpc_resp)
+        if content_type.contains("text/event-stream") {
+            Self::decode_sse_response_stream(resp.bytes_stream(), &target_id, &self.server_name)
+                .await
+        } else if content_type.contains("json") {
+            Self::decode_json_response(resp, &target_id, &self.server_name).await
+        } else if content_type.is_empty() {
+            let bytes = resp.bytes().await.map_err(|e| {
+                McpError::Transport(format!(
+                    "Failed to read response body from '{}': {e}",
+                    self.server_name
+                ))
+            })?;
+            Self::decode_inferred_response(&bytes, &target_id, &self.server_name)
+        } else {
+            Err(McpError::Transport(format!(
+                "Unexpected Content-Type '{content_type}' from MCP server '{}'",
+                self.server_name
+            )))
+        }
     }
 
     async fn send_notification(&self, notification: JsonRpcNotification) -> Result<(), McpError> {
-        let mut req_builder = self.client.post(&self.endpoint_url).json(&notification);
+        if !self.is_alive() {
+            return Err(McpError::NotConnected(self.server_name.clone()));
+        }
+
+        let mut req_builder = self
+            .client
+            .post(&self.endpoint_url)
+            .header("Accept", "application/json, text/event-stream")
+            .json(&notification);
 
         for (k, v) in &self.headers {
             req_builder = req_builder.header(k, v);
         }
 
-        let _ = req_builder.send().await;
+        if let Some(session_id) = self.session_id.read().await.as_ref() {
+            req_builder = req_builder.header("mcp-session-id", session_id);
+        }
+
+        let resp = req_builder
+            .send()
+            .await
+            .map_err(|e| McpError::Transport(format!("Failed to send notification: {e}")))?;
+
+        if let Some(session_header) = resp.headers().get("mcp-session-id") {
+            if let Ok(val) = session_header.to_str() {
+                let mut sid = self.session_id.write().await;
+                *sid = Some(val.to_string());
+            }
+        }
+
         Ok(())
     }
 
@@ -723,6 +1010,7 @@ impl McpTransport for HttpTransport {
 
     async fn close(&self) -> Result<(), McpError> {
         self.is_running.store(false, Ordering::SeqCst);
+        *self.session_id.write().await = None;
         Ok(())
     }
 }
@@ -816,5 +1104,482 @@ mod tests {
         transport.close().await.expect("close transport");
         assert!(receiver.await.is_err());
         assert!(!transport.is_alive());
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Streamable HTTP Regression Tests (Points 1 - 11)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn spawn_mock_mcp_server<F>(handler: F) -> (String, oneshot::Sender<()>)
+    where
+        F: Fn(String, String) -> (u16, Vec<(&'static str, String)>, Vec<u8>)
+            + Send
+            + Sync
+            + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let handler = Arc::new(handler);
+
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    Ok((mut socket, _)) = listener.accept() => {
+                        let handler_clone = handler.clone();
+                        tokio::spawn(async move {
+                            let mut buf = vec![0u8; 8192];
+                            let mut total = Vec::new();
+                            loop {
+                                let n = match socket.read(&mut buf).await {
+                                    Ok(0) => break,
+                                    Ok(n) => n,
+                                    Err(_) => break,
+                                };
+                                total.extend_from_slice(&buf[..n]);
+                                if let Some(pos) = total.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    let header_bytes = &total[..pos];
+                                    let headers_str = String::from_utf8_lossy(header_bytes).to_string();
+                                    let mut content_len = 0;
+                                    for line in headers_str.lines() {
+                                        if let Some((k, v)) = line.split_once(':') {
+                                            if k.trim().eq_ignore_ascii_case("content-length") {
+                                                content_len = v.trim().parse().unwrap_or(0);
+                                            }
+                                        }
+                                    }
+                                    let body_start = pos + 4;
+                                    let body_bytes = &total[body_start..];
+                                    if body_bytes.len() >= content_len {
+                                        let body_str = String::from_utf8_lossy(&body_bytes[..content_len]).to_string();
+                                        let (status, resp_headers, resp_body) = handler_clone(headers_str, body_str);
+                                        let status_text = match status {
+                                            200 => "200 OK",
+                                            400 => "400 Bad Request",
+                                            401 => "401 Unauthorized",
+                                            404 => "404 Not Found",
+                                            500 => "500 Internal Server Error",
+                                            _ => "200 OK",
+                                        };
+                                        let mut response = format!(
+                                            "HTTP/1.1 {status_text}\r\nContent-Length: {}\r\nConnection: close\r\n",
+                                            resp_body.len()
+                                        );
+                                        for (hk, hv) in resp_headers {
+                                            response.push_str(&format!("{hk}: {hv}\r\n"));
+                                        }
+                                        response.push_str("\r\n");
+                                        let _ = socket.write_all(response.as_bytes()).await;
+                                        let _ = socket.write_all(&resp_body).await;
+                                        let _ = socket.flush().await;
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
+        (format!("http://127.0.0.1:{}", addr.port()), shutdown_tx)
+    }
+
+    async fn spawn_chunked_sse_mock_server(chunks: Vec<Vec<u8>>) -> (String, oneshot::Sender<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = &mut shutdown_rx => {},
+                Ok((mut socket, _)) = listener.accept() => {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                    let _ = socket.write_all(header.as_bytes()).await;
+                    for c in chunks {
+                        let chunk_hdr = format!("{:X}\r\n", c.len());
+                        let _ = socket.write_all(chunk_hdr.as_bytes()).await;
+                        let _ = socket.write_all(&c).await;
+                        let _ = socket.write_all(b"\r\n").await;
+                        let _ = socket.flush().await;
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    let _ = socket.write_all(b"0\r\n\r\n").await;
+                    let _ = socket.flush().await;
+                }
+            }
+        });
+
+        (format!("http://127.0.0.1:{}", addr.port()), shutdown_tx)
+    }
+
+    #[tokio::test]
+    async fn test_1_application_json_mcp_response_parsing() {
+        let (url, _shutdown) = spawn_mock_mcp_server(|_, _| {
+            let body = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "req-1",
+                "result": { "status": "json_ok" }
+            });
+            (
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                serde_json::to_vec(&body).unwrap(),
+            )
+        })
+        .await;
+
+        let transport = HttpTransport::new("test", url, HashMap::new());
+        let req = JsonRpcRequest::new("req-1", "ping", None);
+        let resp = transport
+            .send_request(req, Duration::from_secs(5))
+            .await
+            .expect("send request");
+
+        assert_eq!(resp.id, serde_json::json!("req-1"));
+        assert_eq!(
+            resp.result,
+            Some(serde_json::json!({ "status": "json_ok" }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_2_text_event_stream_mcp_response_parsing() {
+        let (url, _shutdown) = spawn_mock_mcp_server(|_, _| {
+            let sse_body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"req-2\",\"result\":{\"status\":\"sse_ok\"}}\n\n";
+            (
+                200,
+                vec![("Content-Type", "text/event-stream".to_string())],
+                sse_body.as_bytes().to_vec(),
+            )
+        })
+        .await;
+
+        let transport = HttpTransport::new("test", url, HashMap::new());
+        let req = JsonRpcRequest::new("req-2", "ping", None);
+        let resp = transport
+            .send_request(req, Duration::from_secs(5))
+            .await
+            .expect("send request over SSE");
+
+        assert_eq!(resp.id, serde_json::json!("req-2"));
+        assert_eq!(resp.result, Some(serde_json::json!({ "status": "sse_ok" })));
+    }
+
+    #[tokio::test]
+    async fn test_3_multiple_sse_events_in_response() {
+        let (url, _shutdown) = spawn_mock_mcp_server(|_, _| {
+            let sse_body = concat!(
+                ": keepalive comment\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"req-other\",\"result\":{\"other\":true}}\n\n",
+                "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"req-target\",\"result\":{\"target\":true}}\n\n"
+            );
+            (
+                200,
+                vec![("Content-Type", "text/event-stream".to_string())],
+                sse_body.as_bytes().to_vec(),
+            )
+        })
+        .await;
+
+        let transport = HttpTransport::new("test", url, HashMap::new());
+        let req = JsonRpcRequest::new("req-target", "ping", None);
+        let resp = transport
+            .send_request(req, Duration::from_secs(5))
+            .await
+            .expect("parse target event");
+
+        assert_eq!(resp.id, serde_json::json!("req-target"));
+        assert_eq!(resp.result, Some(serde_json::json!({ "target": true })));
+    }
+
+    #[tokio::test]
+    async fn test_4_partial_chunked_sse_frames() {
+        let chunks = vec![
+            b"event: mess".to_vec(),
+            b"age\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"chunk-1\",".to_vec(),
+            b"\"result\":{\"chunked\":true}}\r\n\r\n".to_vec(),
+        ];
+        let (url, _shutdown) = spawn_chunked_sse_mock_server(chunks).await;
+
+        let transport = HttpTransport::new("test", url, HashMap::new());
+        let req = JsonRpcRequest::new("chunk-1", "ping", None);
+        let resp = transport
+            .send_request(req, Duration::from_secs(5))
+            .await
+            .expect("parse chunked SSE");
+
+        assert_eq!(resp.id, serde_json::json!("chunk-1"));
+        assert_eq!(resp.result, Some(serde_json::json!({ "chunked": true })));
+    }
+
+    #[test]
+    fn test_5_correct_json_rpc_request_id_routing() {
+        let data_single = r#"{"jsonrpc":"2.0","id":42,"result":{"answer":42}}"#;
+        let matched = parse_json_rpc_response_from_data(data_single, "42");
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().id, serde_json::json!(42));
+
+        let unmatched = parse_json_rpc_response_from_data(data_single, "99");
+        assert!(unmatched.is_none());
+
+        let data_batch = r#"[
+            {"jsonrpc":"2.0","id":"a","result":{"val":"A"}},
+            {"jsonrpc":"2.0","id":"b","result":{"val":"B"}}
+        ]"#;
+        let matched_b = parse_json_rpc_response_from_data(data_batch, "b");
+        assert!(matched_b.is_some());
+        assert_eq!(
+            matched_b.unwrap().result,
+            Some(serde_json::json!({ "val": "B" }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_6_mcp_initialize_over_streamable_http() {
+        let (url, _shutdown) = spawn_mock_mcp_server(|_, _| {
+            let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"mock-server\",\"version\":\"1.0.0\"}}}\n\n";
+            (
+                200,
+                vec![("Content-Type", "text/event-stream".to_string())],
+                body.as_bytes().to_vec(),
+            )
+        })
+        .await;
+
+        let transport = Arc::new(HttpTransport::new("test", url, HashMap::new()));
+        let client = crate::client::McpClient::new("test", transport, Duration::from_secs(5));
+
+        let init_result = client.initialize().await.expect("initialize client");
+        assert_eq!(init_result.server_info.name, "mock-server");
+        assert_eq!(client.state().await, crate::client::McpServerState::Ready);
+    }
+
+    #[tokio::test]
+    async fn test_7_tools_list_over_streamable_http() {
+        let (url, _shutdown) = spawn_mock_mcp_server(|_, body| {
+            let id_str = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("id").cloned())
+                .map(|id| match id {
+                    serde_json::Value::String(s) => s,
+                    serde_json::Value::Number(n) => n.to_string(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_else(|| "1".to_string());
+
+            if body.contains("\"method\":\"initialize\"") {
+                let init = format!("event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"{id_str}\",\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{}},\"serverInfo\":{{\"name\":\"mock-server\",\"version\":\"1.0.0\"}}}}}}\n\n");
+                (
+                    200,
+                    vec![("Content-Type", "text/event-stream".to_string())],
+                    init.as_bytes().to_vec(),
+                )
+            } else if body.contains("\"method\":\"tools/list\"") {
+                let tools = format!("event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"{id_str}\",\"result\":{{\"tools\":[{{\"name\":\"test_tool\",\"description\":\"A test tool\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}\n\n");
+                (
+                    200,
+                    vec![("Content-Type", "text/event-stream".to_string())],
+                    tools.as_bytes().to_vec(),
+                )
+            } else {
+                // notification
+                (200, vec![], vec![])
+            }
+        })
+        .await;
+
+        let transport = Arc::new(HttpTransport::new("test", url, HashMap::new()));
+        let client = crate::client::McpClient::new("test", transport, Duration::from_secs(5));
+        client.initialize().await.expect("initialize client");
+
+        let tools = client.list_tools().await.expect("list tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "test_tool");
+    }
+
+    #[tokio::test]
+    async fn test_8_authentication_header_generation() {
+        let (url, _shutdown) = spawn_mock_mcp_server(|headers, _| {
+            let has_auth = headers
+                .to_lowercase()
+                .contains("authorization: bearer test-secret-pat");
+            if has_auth {
+                let body = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"auth-1\",\"result\":{\"authorized\":true}}\n\n";
+                (
+                    200,
+                    vec![("Content-Type", "text/event-stream".to_string())],
+                    body.as_bytes().to_vec(),
+                )
+            } else {
+                (401, vec![], b"Unauthorized".to_vec())
+            }
+        })
+        .await;
+
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer test-secret-pat".to_string(),
+        );
+        let transport = HttpTransport::new("test", url, headers);
+
+        let req = JsonRpcRequest::new("auth-1", "ping", None);
+        let resp = transport
+            .send_request(req, Duration::from_secs(5))
+            .await
+            .expect("authenticated request");
+
+        assert_eq!(resp.result, Some(serde_json::json!({ "authorized": true })));
+    }
+
+    #[tokio::test]
+    async fn test_9_invalid_json_response_handling() {
+        let (url, _shutdown) = spawn_mock_mcp_server(|_, _| {
+            (
+                200,
+                vec![("Content-Type", "application/json".to_string())],
+                b"invalid-json-body".to_vec(),
+            )
+        })
+        .await;
+
+        let transport = HttpTransport::new("test", url, HashMap::new());
+        let req = JsonRpcRequest::new("1", "ping", None);
+        let res = transport.send_request(req, Duration::from_secs(5)).await;
+
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("Failed to parse HTTP JSON-RPC response"));
+    }
+
+    #[tokio::test]
+    async fn test_10_unexpected_content_type_handling() {
+        let (url, _shutdown) = spawn_mock_mcp_server(|_, _| {
+            (
+                200,
+                vec![("Content-Type", "text/html".to_string())],
+                b"<html><body>502 Bad Gateway</body></html>".to_vec(),
+            )
+        })
+        .await;
+
+        let transport = HttpTransport::new("test", url, HashMap::new());
+        let req = JsonRpcRequest::new("1", "ping", None);
+        let res = transport.send_request(req, Duration::from_secs(5)).await;
+
+        assert!(res.is_err());
+        let err_msg = res.unwrap_err().to_string();
+        assert!(err_msg.contains("Unexpected Content-Type 'text/html'"));
+    }
+
+    #[tokio::test]
+    async fn test_11_github_style_remote_mcp_response_behavior() {
+        let (url, _shutdown) = spawn_mock_mcp_server(|headers, body| {
+            if body.contains("\"method\":\"initialize\"") {
+                let init = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"serverInfo\":{\"name\":\"github-mcp-server\",\"version\":\"remote-1.0\"}}}\n\n";
+                (
+                    200,
+                    vec![
+                        ("Content-Type", "text/event-stream".to_string()),
+                        ("mcp-session-id", "gh-session-token-999".to_string()),
+                    ],
+                    init.as_bytes().to_vec(),
+                )
+            } else {
+                let has_session_hdr = headers
+                    .to_lowercase()
+                    .contains("mcp-session-id: gh-session-token-999");
+                let resp = format!(
+                    "event: message\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"2\",\"result\":{{\"session_verified\":{has_session_hdr}}}}}\n\n"
+                );
+                (
+                    200,
+                    vec![("Content-Type", "text/event-stream".to_string())],
+                    resp.as_bytes().to_vec(),
+                )
+            }
+        })
+        .await;
+
+        let transport = Arc::new(HttpTransport::new("github", url, HashMap::new()));
+        let client =
+            crate::client::McpClient::new("github", transport.clone(), Duration::from_secs(5));
+
+        // 1. Initialize
+        client.initialize().await.expect("initialize github mcp");
+        assert_eq!(
+            transport.session_id().await,
+            Some("gh-session-token-999".to_string())
+        );
+
+        // 2. Subsequent request
+        let req2 = JsonRpcRequest::new("2", "custom/check", None);
+        let resp2 = transport
+            .send_request(req2, Duration::from_secs(5))
+            .await
+            .expect("subsequent request with session id");
+
+        assert_eq!(
+            resp2.result,
+            Some(serde_json::json!({ "session_verified": true }))
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "Live integration test requiring GITHUB_TOKEN or GH_TOKEN"]
+    async fn test_live_github_remote_mcp_server() {
+        let token = std::env::var("GITHUB_TOKEN")
+            .or_else(|_| std::env::var("GH_TOKEN"))
+            .unwrap_or_default();
+        if token.is_empty() {
+            println!("Skipping live GitHub MCP test: GITHUB_TOKEN / GH_TOKEN not set");
+            return;
+        }
+
+        let mut headers = HashMap::new();
+        headers.insert("Authorization".to_string(), format!("Bearer {}", token));
+
+        let transport = Arc::new(HttpTransport::new(
+            "github",
+            "https://api.githubcopilot.com/mcp/",
+            headers,
+        ));
+        let client =
+            crate::client::McpClient::new("github", transport.clone(), Duration::from_secs(30));
+
+        // 1. Initialize
+        let init_result = client.initialize().await.expect("Live initialize failed");
+        assert_eq!(init_result.server_info.name, "github-mcp-server");
+        assert!(transport.session_id().await.is_some());
+
+        // 2. List tools
+        let tools = client.list_tools().await.expect("Live list_tools failed");
+        assert!(!tools.is_empty(), "Tools list should not be empty");
+        let has_list_issues = tools.iter().any(|t| t.name == "list_issues");
+        assert!(has_list_issues, "list_issues tool should be present");
+
+        // 3. Call tool (list_issues for PareekshithPalat/HADES_CLI)
+        let call_res = client
+            .call_tool(
+                "list_issues",
+                serde_json::json!({
+                    "owner": "PareekshithPalat",
+                    "repo": "HADES_CLI"
+                }),
+            )
+            .await
+            .expect("Live call_tool failed");
+
+        assert!(
+            !call_res.content.is_empty(),
+            "Tool call should return non-empty content"
+        );
     }
 }

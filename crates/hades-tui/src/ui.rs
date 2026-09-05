@@ -649,41 +649,19 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-/// Renders the floating Command Palette overlay.
+/// Renders the floating Command Palette overlay with interactive query input, filtered results, and conditional scrollbar.
 fn render_command_palette(frame: &mut Frame, app: &HadesApp, state: &TuiState, area: Rect) {
-    let popup_area = centered_rect(60, 50, area);
+    let popup_area = centered_rect(70, 60, area);
     frame.render_widget(Clear, popup_area);
 
-    let commands = app.commands().list();
-    let items: Vec<ListItem> = commands
-        .iter()
-        .enumerate()
-        .map(|(idx, cmd)| {
-            let is_selected = idx == state.selected_palette_index;
-            let style = if is_selected {
-                Style::default()
-                    .fg(HadesTheme::RATATUI_ORANGE)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            let prefix = if is_selected { " ▸ " } else { "   " };
-            let line = Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(
-                    format!("{:<12}", cmd.name),
-                    style.add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(" {}", cmd.description), style),
-            ]);
-
-            ListItem::new(line)
-        })
-        .collect();
+    let title = if let Some(ref parent) = state.active_subcommand_parent {
+        format!(" {} Subcommands ", parent.trim_start_matches('/'))
+    } else {
+        " Command Palette ".to_string()
+    };
 
     let block = Block::default()
-        .title(" Commands ")
+        .title(title)
         .title_style(
             Style::default()
                 .fg(HadesTheme::RATATUI_ORANGE)
@@ -693,8 +671,182 @@ fn render_command_palette(frame: &mut Frame, app: &HadesApp, state: &TuiState, a
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(HadesTheme::RATATUI_ORANGE));
 
-    let list = List::new(items).block(block);
-    frame.render_widget(list, popup_area);
+    let inner_area = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    if inner_area.height < 3 || inner_area.width < 10 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // input query row
+            Constraint::Length(1), // separator
+            Constraint::Min(1),    // command items list
+            Constraint::Length(1), // separator
+            Constraint::Length(1), // keyboard hints
+        ])
+        .split(inner_area);
+
+    // 1. Query input row
+    let query_text = if state.prompt_input.is_empty() {
+        "/"
+    } else {
+        &state.prompt_input
+    };
+    let query_spans = vec![
+        Span::styled(
+            " › ",
+            Style::default()
+                .fg(HadesTheme::RATATUI_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            query_text,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("▌", Style::default().fg(HadesTheme::RATATUI_ORANGE)),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(query_spans)), chunks[0]);
+
+    // 2. Top separator
+    let sep1 = "─".repeat(chunks[1].width as usize);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            sep1,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[1],
+    );
+
+    // 3. Command items list with filtering and conditional scrollbar
+    let list_area = chunks[2];
+    let visible_capacity = list_area.height as usize;
+    let items = app.commands().filter_palette(
+        &state.prompt_input,
+        state.active_subcommand_parent.as_deref(),
+    );
+    let total_items = items.len();
+
+    let scroll_offset = if total_items <= visible_capacity || visible_capacity == 0 {
+        0
+    } else {
+        let mut off = state.palette_scroll_offset;
+        if state.selected_palette_index < off {
+            off = state.selected_palette_index;
+        } else if state.selected_palette_index >= off + visible_capacity {
+            off = state.selected_palette_index + 1 - visible_capacity;
+        }
+        off.min(total_items.saturating_sub(visible_capacity))
+    };
+
+    if total_items == 0 {
+        let empty_msg = Paragraph::new(Line::from(Span::styled(
+            "   No matching commands found. Press Esc to return.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        frame.render_widget(empty_msg, list_area);
+    } else {
+        let end = (scroll_offset + visible_capacity).min(total_items);
+        let visible_items = &items[scroll_offset..end];
+
+        let list_items: Vec<ListItem> = visible_items
+            .iter()
+            .enumerate()
+            .map(|(local_idx, item)| {
+                let global_idx = scroll_offset + local_idx;
+                let is_selected = global_idx == state.selected_palette_index;
+
+                let style = if is_selected {
+                    Style::default()
+                        .fg(HadesTheme::RATATUI_ORANGE)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                let desc_style = if is_selected {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+
+                let prefix = if is_selected { " ▸ " } else { "   " };
+                let suffix = if item.has_subcommands { " ›" } else { "" };
+                let name_formatted = format!("{:<16}{}", item.display_name, suffix);
+
+                let line = Line::from(vec![
+                    Span::styled(prefix, style),
+                    Span::styled(name_formatted, style.add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("  {}", item.description), desc_style),
+                ]);
+
+                ListItem::new(line)
+            })
+            .collect();
+
+        let list_widget = List::new(list_items);
+        frame.render_widget(list_widget, list_area);
+
+        // Render scrollbar ONLY when entries overflow the available vertical area
+        if total_items > visible_capacity && visible_capacity > 0 {
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .track_symbol(Some("│"))
+                .thumb_symbol("█");
+            let mut scrollbar_state =
+                ScrollbarState::new(total_items).position(state.selected_palette_index);
+            frame.render_stateful_widget(scrollbar, list_area, &mut scrollbar_state);
+        }
+    }
+
+    // 4. Bottom separator
+    let sep2 = "─".repeat(chunks[3].width as usize);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            sep2,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[3],
+    );
+
+    // 5. Keyboard hints
+    let hint_line = Line::from(vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(
+            "↑↓",
+            Style::default()
+                .fg(HadesTheme::RATATUI_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Navigate   ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Enter",
+            Style::default()
+                .fg(HadesTheme::RATATUI_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Select   ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Tab",
+            Style::default()
+                .fg(HadesTheme::RATATUI_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Complete   ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "Esc",
+            Style::default()
+                .fg(HadesTheme::RATATUI_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Close", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(hint_line), chunks[4]);
 }
 
 /// Renders the floating Session Switcher modal with relative timestamps and active indicators.

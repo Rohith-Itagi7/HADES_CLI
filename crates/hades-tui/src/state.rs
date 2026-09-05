@@ -99,6 +99,12 @@ pub struct TuiState {
     /// Currently highlighted index within the command palette.
     pub selected_palette_index: usize,
 
+    /// Optional parent command if currently in a second-level subcommand selection menu.
+    pub active_subcommand_parent: Option<String>,
+
+    /// Vertical scroll offset in the command palette when items overflow visible area.
+    pub palette_scroll_offset: usize,
+
     /// User prompt input buffer for chat in Running state.
     pub prompt_input: String,
 
@@ -336,6 +342,30 @@ impl TuiState {
         if self.prompt_cursor_position > 0 {
             self.prompt_cursor_position -= 1;
             self.prompt_input.remove(self.prompt_cursor_position);
+        }
+    }
+
+    /// Removes a character following the cursor in the user chat prompt.
+    pub fn delete_prompt_char(&mut self) {
+        if self.prompt_cursor_position < self.prompt_input.len() {
+            self.prompt_input.remove(self.prompt_cursor_position);
+        }
+    }
+
+    /// Adjusts command palette scroll offset so the selected item remains visible.
+    pub fn adjust_palette_scroll(&mut self, total_items: usize, visible_capacity: usize) {
+        if total_items <= visible_capacity || visible_capacity == 0 {
+            self.palette_scroll_offset = 0;
+            return;
+        }
+        if self.selected_palette_index < self.palette_scroll_offset {
+            self.palette_scroll_offset = self.selected_palette_index;
+        } else if self.selected_palette_index >= self.palette_scroll_offset + visible_capacity {
+            self.palette_scroll_offset = self.selected_palette_index + 1 - visible_capacity;
+        }
+        let max_offset = total_items.saturating_sub(visible_capacity);
+        if self.palette_scroll_offset > max_offset {
+            self.palette_scroll_offset = max_offset;
         }
     }
 

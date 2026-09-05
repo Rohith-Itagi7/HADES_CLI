@@ -9,7 +9,8 @@ pub use app::{HadesApp, APP_VERSION};
 pub use command::{
     Command, CommandContext, CommandInfo, CommandOutput, CommandRegistry, ExitCommand,
     ExportCommand, HelpCommand, HelpEntry, ImportCommand, ModelCommand, NewSessionCommand,
-    NotifyCommand, SessionsCommand, StatusCommand, StatusInfo, SwitchCommand,
+    NotifyCommand, PaletteItem, SessionsCommand, StatusCommand, StatusInfo, SubcommandInfo,
+    SwitchCommand,
 };
 
 pub use context::{ContextManager, ContextReport, TokenEstimator, UsageKind};

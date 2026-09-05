@@ -1001,4 +1001,412 @@ mod tests {
         assert_eq!(res, KeyActionResult::VerifyModel);
         assert_eq!(app.state(), AppState::Verifying);
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Command Palette Redesign Integration Tests (Test Points 1 - 20)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_1_slash_opens_command_palette_and_leaves_prompt_slash() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        assert_eq!(app.state(), AppState::Running);
+        assert_eq!(state.prompt_input, "");
+
+        let action =
+            InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state)
+                .expect("open palette");
+
+        assert_eq!(action, KeyActionResult::Handled);
+        assert_eq!(app.state(), AppState::CommandPalette);
+        assert_eq!(state.prompt_input, "/");
+        assert_eq!(state.prompt_cursor_position, 1);
+    }
+
+    #[test]
+    fn test_2_subsequent_characters_append_to_prompt_input() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+
+        assert_eq!(app.state(), AppState::CommandPalette);
+        assert_eq!(state.prompt_input, "/mcp");
+        assert_eq!(state.prompt_cursor_position, 4);
+    }
+
+    #[test]
+    fn test_3_workflow_b_direct_mcp_add_opens_setup() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp add".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+        assert_eq!(state.prompt_input, "/mcp add");
+
+        let action =
+            InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+
+        assert_eq!(action, KeyActionResult::Handled);
+        assert_eq!(app.state(), AppState::McpSetup);
+    }
+
+    #[test]
+    fn test_4_slash_mcp_filters_palette() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+
+        let filtered = app.commands().filter_palette(&state.prompt_input, None);
+        assert!(!filtered.is_empty());
+        assert_eq!(filtered[0].execution_text, "/mcp");
+    }
+
+    #[test]
+    fn test_5_workflow_a_mcp_enter_enters_subcommands() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+
+        let action =
+            InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+
+        assert_eq!(action, KeyActionResult::Handled);
+        assert_eq!(app.state(), AppState::CommandPalette);
+        assert_eq!(state.active_subcommand_parent, Some("/mcp".to_string()));
+        assert_eq!(state.selected_palette_index, 0);
+    }
+
+    #[test]
+    fn test_6_subcommands_up_down_navigation() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+        InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+        assert_eq!(state.active_subcommand_parent, Some("/mcp".to_string()));
+        assert_eq!(state.selected_palette_index, 0);
+
+        InputHandler::handle_key_event(make_key(KeyCode::Down), &mut app, &mut state).unwrap();
+        assert_eq!(state.selected_palette_index, 1);
+
+        InputHandler::handle_key_event(make_key(KeyCode::Down), &mut app, &mut state).unwrap();
+        assert_eq!(state.selected_palette_index, 2);
+
+        InputHandler::handle_key_event(make_key(KeyCode::Up), &mut app, &mut state).unwrap();
+        assert_eq!(state.selected_palette_index, 1);
+    }
+
+    #[test]
+    fn test_7_subcommand_add_opens_mcp_setup() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+        InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+        assert_eq!(state.selected_palette_index, 0);
+
+        let action =
+            InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+
+        assert_eq!(action, KeyActionResult::Handled);
+        assert_eq!(app.state(), AppState::McpSetup);
+    }
+
+    #[test]
+    fn test_8_subcommand_remove_populates_prompt() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+        InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Down), &mut app, &mut state).unwrap();
+        assert_eq!(state.selected_palette_index, 1);
+
+        let action =
+            InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+
+        assert_eq!(action, KeyActionResult::Handled);
+        assert_eq!(app.state(), AppState::CommandPalette);
+        assert_eq!(state.prompt_input, "/mcp remove ");
+        assert_eq!(state.active_subcommand_parent, None);
+    }
+
+    #[test]
+    fn test_9_subcommand_test_populates_prompt() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+        InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Down), &mut app, &mut state).unwrap();
+        InputHandler::handle_key_event(make_key(KeyCode::Down), &mut app, &mut state).unwrap();
+        assert_eq!(state.selected_palette_index, 2);
+
+        let action =
+            InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+
+        assert_eq!(action, KeyActionResult::Handled);
+        assert_eq!(app.state(), AppState::CommandPalette);
+        assert_eq!(state.prompt_input, "/mcp test ");
+        assert_eq!(state.active_subcommand_parent, None);
+    }
+
+    #[test]
+    fn test_10_mcp_remove_with_argument_returns_action() {
+        let dir = tempdir().expect("create temp dir");
+        let config_service = hades_config::ConfigService::with_path(dir.path().join("config.toml"));
+        let mut config = hades_config::HadesConfig::default();
+        config.mcp.servers.insert(
+            "my-server".to_string(),
+            hades_config::McpServerConfig {
+                auto_start: false,
+                ..Default::default()
+            },
+        );
+        config_service.save(&config).expect("save config");
+
+        let storage_service = hades_storage::StorageService::with_root(dir.path().join("data"));
+        let event_bus = hades_events::EventBus::new();
+        let mut app = HadesApp::new(config_service, storage_service, event_bus);
+        app.init().expect("init app");
+        app.transition_to(AppState::Running)
+            .expect("transition to running");
+
+        let mut state = TuiState::new();
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp remove my-server".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+
+        let action =
+            InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+
+        assert_eq!(
+            action,
+            KeyActionResult::RemoveMcpServer("my-server".to_string())
+        );
+    }
+
+    #[test]
+    fn test_11_mcp_test_with_argument_returns_action() {
+        let dir = tempdir().expect("create temp dir");
+        let config_service = hades_config::ConfigService::with_path(dir.path().join("config.toml"));
+        let mut config = hades_config::HadesConfig::default();
+        config.mcp.servers.insert(
+            "my-server".to_string(),
+            hades_config::McpServerConfig {
+                auto_start: false,
+                ..Default::default()
+            },
+        );
+        config_service.save(&config).expect("save config");
+
+        let storage_service = hades_storage::StorageService::with_root(dir.path().join("data"));
+        let event_bus = hades_events::EventBus::new();
+        let mut app = HadesApp::new(config_service, storage_service, event_bus);
+        app.init().expect("init app");
+        app.transition_to(AppState::Running)
+            .expect("transition to running");
+
+        let mut state = TuiState::new();
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp test my-server".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+
+        let action =
+            InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+
+        assert_eq!(
+            action,
+            KeyActionResult::TestMcpServer("my-server".to_string())
+        );
+    }
+
+    #[test]
+    fn test_12_backspace_removes_characters_and_updates_filtering() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+        assert_eq!(state.prompt_input, "/mcp");
+
+        InputHandler::handle_key_event(make_key(KeyCode::Backspace), &mut app, &mut state).unwrap();
+        assert_eq!(state.prompt_input, "/mc");
+        assert_eq!(app.state(), AppState::CommandPalette);
+    }
+
+    #[test]
+    fn test_13_backspace_on_single_slash_returns_to_running() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        assert_eq!(state.prompt_input, "/");
+        assert_eq!(app.state(), AppState::CommandPalette);
+
+        InputHandler::handle_key_event(make_key(KeyCode::Backspace), &mut app, &mut state).unwrap();
+        assert_eq!(state.prompt_input, "");
+        assert_eq!(app.state(), AppState::Running);
+    }
+
+    #[test]
+    fn test_14_backspace_in_subcommands_clears_parent() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+        InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+        assert_eq!(state.active_subcommand_parent, Some("/mcp".to_string()));
+
+        InputHandler::handle_key_event(make_key(KeyCode::Backspace), &mut app, &mut state).unwrap();
+        assert_eq!(state.active_subcommand_parent, None);
+        assert_eq!(app.state(), AppState::CommandPalette);
+    }
+
+    #[test]
+    fn test_15_esc_in_command_palette_transitions_to_running_and_clears_subcommand() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mcp".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+        InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state).unwrap();
+        assert_eq!(state.active_subcommand_parent, Some("/mcp".to_string()));
+
+        let action =
+            InputHandler::handle_key_event(make_key(KeyCode::Esc), &mut app, &mut state).unwrap();
+
+        assert_eq!(action, KeyActionResult::Handled);
+        assert_eq!(app.state(), AppState::Running);
+        assert_eq!(state.active_subcommand_parent, None);
+        assert_eq!(state.prompt_input, "/mcp");
+    }
+
+    #[test]
+    fn test_16_tab_completes_highlighted_command() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+        for c in "mod".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+
+        let items = app.commands().filter_palette(&state.prompt_input, None);
+        assert_eq!(items[0].execution_text, "/model");
+
+        let action =
+            InputHandler::handle_key_event(make_key(KeyCode::Tab), &mut app, &mut state).unwrap();
+
+        assert_eq!(action, KeyActionResult::Handled);
+        assert_eq!(state.prompt_input, "/model");
+    }
+
+    #[test]
+    fn test_17_typing_non_slash_does_not_open_palette() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        for c in "hello world".chars() {
+            InputHandler::handle_key_event(make_key(KeyCode::Char(c)), &mut app, &mut state)
+                .unwrap();
+        }
+
+        assert_eq!(app.state(), AppState::Running);
+        assert_eq!(state.prompt_input, "hello world");
+    }
+
+    #[test]
+    fn test_18_typing_slash_mid_sentence_does_not_open_palette() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+
+        state.prompt_input = "see ".to_string();
+        state.prompt_cursor_position = 4;
+
+        InputHandler::handle_key_event(make_key(KeyCode::Char('/')), &mut app, &mut state).unwrap();
+
+        assert_eq!(app.state(), AppState::Running);
+        assert_eq!(state.prompt_input, "see /");
+        assert_eq!(state.prompt_cursor_position, 5);
+    }
+
+    #[test]
+    fn test_19_palette_scrolling_offset_updates_correctly() {
+        let mut state = TuiState::new();
+        let total = 20;
+        let visible = 6;
+
+        state.selected_palette_index = 0;
+        state.adjust_palette_scroll(total, visible);
+        assert_eq!(state.palette_scroll_offset, 0);
+
+        state.selected_palette_index = 5;
+        state.adjust_palette_scroll(total, visible);
+        assert_eq!(state.palette_scroll_offset, 0);
+
+        state.selected_palette_index = 6;
+        state.adjust_palette_scroll(total, visible);
+        assert_eq!(state.palette_scroll_offset, 1);
+
+        state.selected_palette_index = 10;
+        state.adjust_palette_scroll(total, visible);
+        assert_eq!(state.palette_scroll_offset, 5);
+
+        state.selected_palette_index = 3;
+        state.adjust_palette_scroll(total, visible);
+        assert_eq!(state.palette_scroll_offset, 3);
+    }
 }

@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::state::{ChatTurn, TuiState};
 use hades_core::{AppState, CommandOutput, CoreError, HadesApp};
@@ -134,7 +134,10 @@ impl InputHandler {
         match key_event.code {
             // Open command palette on '/' when prompt input is empty
             KeyCode::Char('/') if tui_state.prompt_input.is_empty() => {
+                tui_state.push_prompt_char('/');
                 tui_state.selected_palette_index = 0;
+                tui_state.active_subcommand_parent = None;
+                tui_state.palette_scroll_offset = 0;
                 tui_state.clear_error();
                 app.transition_to(AppState::CommandPalette)?;
                 Ok(KeyActionResult::Handled)
@@ -168,6 +171,7 @@ impl InputHandler {
                             CommandOutput::OpenSessionPicker => {
                                 Ok(KeyActionResult::OpenSessionPicker)
                             }
+                            CommandOutput::OpenMcpSetup => Ok(KeyActionResult::Handled),
                             CommandOutput::RemoveMcpServer(name) => {
                                 Ok(KeyActionResult::RemoveMcpServer(name))
                             }
@@ -364,10 +368,69 @@ impl InputHandler {
         app: &mut HadesApp,
         tui_state: &mut TuiState,
     ) -> Result<KeyActionResult, CoreError> {
-        let commands = app.commands().list();
-        let count = commands.len();
+        let items = app.commands().filter_palette(
+            &tui_state.prompt_input,
+            tui_state.active_subcommand_parent.as_deref(),
+        );
+        let count = items.len();
 
         match key_event.code {
+            KeyCode::Char(c) => {
+                // If currently in a subcommand menu, smoothly exit menu into continuous query
+                if tui_state.active_subcommand_parent.is_some() {
+                    if !tui_state.prompt_input.ends_with(' ') && c != ' ' {
+                        tui_state.push_prompt_char(' ');
+                    }
+                    tui_state.active_subcommand_parent = None;
+                }
+                tui_state.push_prompt_char(c);
+                tui_state.selected_palette_index = 0;
+                tui_state.palette_scroll_offset = 0;
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Backspace => {
+                if tui_state.active_subcommand_parent.is_some() {
+                    // Backspace in subcommand menu returns to top-level command palette
+                    tui_state.active_subcommand_parent = None;
+                    tui_state.selected_palette_index = 0;
+                    tui_state.palette_scroll_offset = 0;
+                } else {
+                    tui_state.pop_prompt_char();
+                    tui_state.selected_palette_index = 0;
+                    tui_state.palette_scroll_offset = 0;
+                    // If prompt input became empty (deleted '/'), return cleanly to Running state
+                    if tui_state.prompt_input.is_empty() {
+                        app.transition_to(AppState::Running)?;
+                    }
+                }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Delete => {
+                tui_state.delete_prompt_char();
+                tui_state.selected_palette_index = 0;
+                tui_state.palette_scroll_offset = 0;
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Left => {
+                if tui_state.prompt_cursor_position > 0 {
+                    tui_state.prompt_cursor_position -= 1;
+                }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Right => {
+                if tui_state.prompt_cursor_position < tui_state.prompt_input.len() {
+                    tui_state.prompt_cursor_position += 1;
+                }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Home => {
+                tui_state.prompt_cursor_position = 0;
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::End => {
+                tui_state.prompt_cursor_position = tui_state.prompt_input.len();
+                Ok(KeyActionResult::Handled)
+            }
             KeyCode::Up => {
                 if count > 0 {
                     tui_state.selected_palette_index = if tui_state.selected_palette_index == 0 {
@@ -375,6 +438,7 @@ impl InputHandler {
                     } else {
                         tui_state.selected_palette_index - 1
                     };
+                    tui_state.adjust_palette_scroll(count, 8);
                 }
                 Ok(KeyActionResult::Handled)
             }
@@ -382,82 +446,140 @@ impl InputHandler {
                 if count > 0 {
                     tui_state.selected_palette_index =
                         (tui_state.selected_palette_index + 1) % count;
+                    tui_state.adjust_palette_scroll(count, 8);
                 }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Tab => {
+                if let Some(item) = items.get(tui_state.selected_palette_index) {
+                    let mut completion = item.execution_text.clone();
+                    if item.has_subcommands && !completion.ends_with(' ') {
+                        completion.push(' ');
+                    }
+                    tui_state.prompt_input = completion;
+                    tui_state.prompt_cursor_position = tui_state.prompt_input.len();
+                    tui_state.active_subcommand_parent = None;
+                    tui_state.selected_palette_index = 0;
+                    tui_state.palette_scroll_offset = 0;
+                }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Esc => {
+                tui_state.active_subcommand_parent = None;
+                tui_state.selected_palette_index = 0;
+                tui_state.palette_scroll_offset = 0;
+                app.transition_to(AppState::Running)?;
                 Ok(KeyActionResult::Handled)
             }
             KeyCode::Enter => {
-                if let Some(cmd_info) = commands.get(tui_state.selected_palette_index) {
-                    let cmd_name = cmd_info.name.clone();
-                    debug!(command = %cmd_name, "Executing selected command from palette");
-
-                    app.transition_to(AppState::Running)?;
-                    match app.execute_command(&cmd_name) {
-                        Ok(output) => match output {
-                            CommandOutput::OpenModelSetup => {
-                                tui_state.is_model_switch_flow = false;
-                                tui_state.providers = app.model_manager().list_providers();
-                                tui_state.selected_provider_index = 0;
-                                Ok(KeyActionResult::Handled)
-                            }
-                            CommandOutput::OpenModelSwitch => {
-                                tui_state.is_model_switch_flow = true;
-                                tui_state.providers = app.model_manager().list_providers();
-                                tui_state.selected_provider_index = 0;
-                                Ok(KeyActionResult::Handled)
-                            }
-                            CommandOutput::NewSession => Ok(KeyActionResult::NewSession),
-                            CommandOutput::OpenSessionPicker => {
-                                Ok(KeyActionResult::OpenSessionPicker)
-                            }
-                            CommandOutput::ExportSuccess(path) => {
-                                tui_state.show_toast(format!(
-                                    "Successfully exported to {}",
-                                    path.display()
-                                ));
-                                tui_state.set_output(CommandOutput::Text(format!(
-                                    "✓ Successfully exported session to {}",
-                                    path.display()
-                                )));
-                                Ok(KeyActionResult::Handled)
-                            }
-                            CommandOutput::ImportSuccess(record) => {
-                                tui_state.reconstruct_turns_from_session(&record);
-                                tui_state.show_toast(format!(
-                                    "Successfully imported: {}",
-                                    record.metadata.title
-                                ));
-                                tui_state.set_output(CommandOutput::Text(format!(
-                                    "✓ Successfully imported session '{}' ({} messages)",
-                                    record.metadata.title,
-                                    record.messages.len()
-                                )));
-                                tui_state.scroll_to_bottom();
-                                Ok(KeyActionResult::Handled)
-                            }
-                            CommandOutput::Exit => Ok(KeyActionResult::Quit),
-                            CommandOutput::RemoveMcpServer(name) => {
-                                Ok(KeyActionResult::RemoveMcpServer(name))
-                            }
-                            CommandOutput::TestMcpServer(name) => {
-                                Ok(KeyActionResult::TestMcpServer(name))
-                            }
-                            _ => {
-                                tui_state.set_output(output);
-                                Ok(KeyActionResult::Handled)
-                            }
-                        },
-                        Err(e) => {
-                            tui_state.set_error(e.to_string());
-                            Ok(KeyActionResult::Handled)
+                // Check if user selected a command with subcommands in top-level mode
+                if tui_state.active_subcommand_parent.is_none() {
+                    if let Some(selected) = items.get(tui_state.selected_palette_index) {
+                        let typed_trimmed = tui_state.prompt_input.trim();
+                        if selected.has_subcommands
+                            && (typed_trimmed == selected.execution_text
+                                || typed_trimmed == "/"
+                                || typed_trimmed == selected.display_name)
+                        {
+                            tui_state.active_subcommand_parent =
+                                Some(selected.execution_text.clone());
+                            tui_state.selected_palette_index = 0;
+                            tui_state.palette_scroll_offset = 0;
+                            return Ok(KeyActionResult::Handled);
                         }
                     }
-                } else {
-                    Ok(KeyActionResult::Handled)
                 }
-            }
-            KeyCode::Esc => {
+
+                // Check if user selected a subcommand that requires additional arguments
+                if tui_state.active_subcommand_parent.is_some() {
+                    if let Some(selected) = items.get(tui_state.selected_palette_index) {
+                        if selected.requires_args {
+                            tui_state.prompt_input = selected.execution_text.clone();
+                            tui_state.prompt_cursor_position = tui_state.prompt_input.len();
+                            tui_state.active_subcommand_parent = None;
+                            tui_state.selected_palette_index = 0;
+                            tui_state.palette_scroll_offset = 0;
+                            return Ok(KeyActionResult::Handled);
+                        }
+                    }
+                }
+
+                // Determine final command string to execute
+                let typed = tui_state.prompt_input.trim().to_string();
+                let command_to_run = if typed.contains(' ') {
+                    typed
+                } else if let Some(selected) = items.get(tui_state.selected_palette_index) {
+                    selected.execution_text.clone()
+                } else if !typed.is_empty() {
+                    typed
+                } else {
+                    return Ok(KeyActionResult::Handled);
+                };
+
+                tui_state.prompt_input.clear();
+                tui_state.prompt_cursor_position = 0;
+                tui_state.active_subcommand_parent = None;
+                tui_state.selected_palette_index = 0;
+                tui_state.palette_scroll_offset = 0;
+
                 app.transition_to(AppState::Running)?;
-                Ok(KeyActionResult::Handled)
+                match app.execute_command(&command_to_run) {
+                    Ok(output) => match output {
+                        CommandOutput::OpenModelSetup => {
+                            tui_state.is_model_switch_flow = false;
+                            tui_state.providers = app.model_manager().list_providers();
+                            tui_state.selected_provider_index = 0;
+                            Ok(KeyActionResult::Handled)
+                        }
+                        CommandOutput::OpenModelSwitch => {
+                            tui_state.is_model_switch_flow = true;
+                            tui_state.providers = app.model_manager().list_providers();
+                            tui_state.selected_provider_index = 0;
+                            Ok(KeyActionResult::Handled)
+                        }
+                        CommandOutput::NewSession => Ok(KeyActionResult::NewSession),
+                        CommandOutput::OpenSessionPicker => Ok(KeyActionResult::OpenSessionPicker),
+                        CommandOutput::OpenMcpSetup => Ok(KeyActionResult::Handled),
+                        CommandOutput::ExportSuccess(path) => {
+                            tui_state
+                                .show_toast(format!("Successfully exported to {}", path.display()));
+                            tui_state.set_output(CommandOutput::Text(format!(
+                                "✓ Successfully exported session to {}",
+                                path.display()
+                            )));
+                            Ok(KeyActionResult::Handled)
+                        }
+                        CommandOutput::ImportSuccess(record) => {
+                            tui_state.reconstruct_turns_from_session(&record);
+                            tui_state.show_toast(format!(
+                                "Successfully imported: {}",
+                                record.metadata.title
+                            ));
+                            tui_state.set_output(CommandOutput::Text(format!(
+                                "✓ Successfully imported session '{}' ({} messages)",
+                                record.metadata.title,
+                                record.messages.len()
+                            )));
+                            tui_state.scroll_to_bottom();
+                            Ok(KeyActionResult::Handled)
+                        }
+                        CommandOutput::Exit => Ok(KeyActionResult::Quit),
+                        CommandOutput::RemoveMcpServer(name) => {
+                            Ok(KeyActionResult::RemoveMcpServer(name))
+                        }
+                        CommandOutput::TestMcpServer(name) => {
+                            Ok(KeyActionResult::TestMcpServer(name))
+                        }
+                        _ => {
+                            tui_state.set_output(output);
+                            Ok(KeyActionResult::Handled)
+                        }
+                    },
+                    Err(e) => {
+                        tui_state.set_error(e.to_string());
+                        Ok(KeyActionResult::Handled)
+                    }
+                }
             }
             _ => Ok(KeyActionResult::Handled),
         }

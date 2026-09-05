@@ -155,12 +155,47 @@ impl fmt::Display for CommandOutput {
     }
 }
 
+/// Metadata describing a subcommand under a hierarchical command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubcommandInfo {
+    /// Canonical subcommand token (e.g. "add", "remove").
+    pub name: String,
+    /// Human-friendly display label (e.g. "Add MCP server").
+    pub display_name: String,
+    /// Description of what the subcommand does.
+    pub description: String,
+    /// Complete command template (e.g. "/mcp add", "/mcp remove ").
+    pub command_template: String,
+    /// Whether this subcommand requires further arguments before execution.
+    pub requires_args: bool,
+}
+
+/// Filtered or browsable item rendered in the command palette.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaletteItem {
+    /// Display text shown in the palette list (e.g. "/mcp add" or "Add MCP server").
+    pub display_name: String,
+    /// Detailed description of the command or action.
+    pub description: String,
+    /// Full command string to execute or populate in input.
+    pub execution_text: String,
+    /// Whether this item represents a subcommand rather than a root command.
+    pub is_subcommand: bool,
+    /// Whether this command possesses child subcommands that can be explored.
+    pub has_subcommands: bool,
+    /// Optional parent command if this item is a subcommand.
+    pub parent_command: Option<String>,
+    /// Whether this item requires additional arguments to be typed.
+    pub requires_args: bool,
+}
+
 /// Metadata describing a command for palettes and help menus.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandInfo {
     pub name: String,
     pub aliases: Vec<String>,
     pub description: String,
+    pub subcommands: Vec<SubcommandInfo>,
 }
 
 use hades_tools::{ToolRegistry, WorkspaceMetadata};
@@ -314,6 +349,11 @@ pub trait Command: Send + Sync {
 
     /// Short human-readable description of what the command does.
     fn description(&self) -> &'static str;
+
+    /// Optional list of subcommands under this command for hierarchical palettes.
+    fn subcommands(&self) -> Vec<SubcommandInfo> {
+        Vec::new()
+    }
 
     /// Executes the command with the provided context.
     fn execute(&self, context: &mut CommandContext) -> Result<CommandOutput, CommandError>;
@@ -663,6 +703,39 @@ impl Command for McpCommand {
         "Manage Model Context Protocol (MCP) servers and tools"
     }
 
+    fn subcommands(&self) -> Vec<SubcommandInfo> {
+        vec![
+            SubcommandInfo {
+                name: "add".to_string(),
+                display_name: "Add MCP server".to_string(),
+                description: "Add and configure an MCP server".to_string(),
+                command_template: "/mcp add".to_string(),
+                requires_args: false,
+            },
+            SubcommandInfo {
+                name: "remove".to_string(),
+                display_name: "Remove MCP server".to_string(),
+                description: "Remove an MCP server".to_string(),
+                command_template: "/mcp remove ".to_string(),
+                requires_args: true,
+            },
+            SubcommandInfo {
+                name: "test".to_string(),
+                display_name: "Test MCP server".to_string(),
+                description: "Test connection to an MCP server".to_string(),
+                command_template: "/mcp test ".to_string(),
+                requires_args: true,
+            },
+            SubcommandInfo {
+                name: "list".to_string(),
+                display_name: "List MCP servers".to_string(),
+                description: "List configured MCP servers and their status".to_string(),
+                command_template: "/mcp list".to_string(),
+                requires_args: false,
+            },
+        ]
+    }
+
     fn execute(&self, context: &mut CommandContext) -> Result<CommandOutput, CommandError> {
         let trimmed = context.raw_input.trim();
         let tokens: Vec<&str> = trimmed.split_whitespace().collect();
@@ -804,6 +877,32 @@ impl Command for NotifyCommand {
         "Inspect and test sound and desktop notification configuration"
     }
 
+    fn subcommands(&self) -> Vec<SubcommandInfo> {
+        vec![
+            SubcommandInfo {
+                name: "test".to_string(),
+                display_name: "Test alert".to_string(),
+                description: "Dispatch test audio chimes and desktop notification".to_string(),
+                command_template: "/notify test".to_string(),
+                requires_args: false,
+            },
+            SubcommandInfo {
+                name: "enable".to_string(),
+                display_name: "Enable notifications".to_string(),
+                description: "Enable audio chimes and system notifications".to_string(),
+                command_template: "/notify enable".to_string(),
+                requires_args: false,
+            },
+            SubcommandInfo {
+                name: "disable".to_string(),
+                display_name: "Disable notifications".to_string(),
+                description: "Disable all audio chimes and notifications".to_string(),
+                command_template: "/notify disable".to_string(),
+                requires_args: false,
+            },
+        ]
+    }
+
     fn execute(&self, context: &mut CommandContext) -> Result<CommandOutput, CommandError> {
         let n = &context.config.notification;
         let mut output = String::from("NOTIFICATION & SOUND CONFIGURATION\n\n");
@@ -911,6 +1010,16 @@ impl Command for AgentsCommand {
 
     fn description(&self) -> &'static str {
         "Inspect specialized collaborative subagents and orchestration status"
+    }
+
+    fn subcommands(&self) -> Vec<SubcommandInfo> {
+        vec![SubcommandInfo {
+            name: "plan".to_string(),
+            display_name: "Plan execution".to_string(),
+            description: "Formulate and inspect a multi-agent plan".to_string(),
+            command_template: "/agents plan ".to_string(),
+            requires_args: true,
+        }]
     }
 
     fn execute(&self, context: &mut CommandContext) -> Result<CommandOutput, CommandError> {
@@ -1095,6 +1204,25 @@ impl Command for ExportCommand {
         "Export conversation transcript to Markdown or JSON (/export [format] [filepath])"
     }
 
+    fn subcommands(&self) -> Vec<SubcommandInfo> {
+        vec![
+            SubcommandInfo {
+                name: "md".to_string(),
+                display_name: "Export to Markdown".to_string(),
+                description: "Export conversation to Markdown transcript".to_string(),
+                command_template: "/export md ".to_string(),
+                requires_args: false,
+            },
+            SubcommandInfo {
+                name: "json".to_string(),
+                display_name: "Export to JSON".to_string(),
+                description: "Export conversation to JSON format".to_string(),
+                command_template: "/export json ".to_string(),
+                requires_args: false,
+            },
+        ]
+    }
+
     fn execute(&self, context: &mut CommandContext) -> Result<CommandOutput, CommandError> {
         let session = context.active_session.ok_or_else(|| {
             CommandError::ExecutionFailed("No active conversation session to export".to_string())
@@ -1267,8 +1395,242 @@ impl CommandRegistry {
                 name: cmd.name().to_string(),
                 aliases: cmd.aliases().iter().map(|s| s.to_string()).collect(),
                 description: cmd.description().to_string(),
+                subcommands: cmd.subcommands(),
             })
             .collect()
+    }
+
+    /// Filters available commands and subcommands based on user input and optional active parent.
+    pub fn filter_palette(
+        &self,
+        input: &str,
+        active_subcommand_parent: Option<&str>,
+    ) -> Vec<PaletteItem> {
+        let trimmed = input.trim();
+
+        // 1. If in hierarchical subcommand mode for a specific parent command:
+        if let Some(parent_key) = active_subcommand_parent {
+            if let Some(parent_cmd) = self.find(parent_key) {
+                let subcommands = parent_cmd.subcommands();
+                if trimmed.is_empty() || trimmed == parent_cmd.name() {
+                    return subcommands
+                        .into_iter()
+                        .map(|sub| PaletteItem {
+                            display_name: sub.display_name,
+                            description: sub.description,
+                            execution_text: sub.command_template,
+                            is_subcommand: true,
+                            has_subcommands: false,
+                            parent_command: Some(parent_cmd.name().to_string()),
+                            requires_args: sub.requires_args,
+                        })
+                        .collect();
+                }
+
+                let query = if trimmed.starts_with(parent_cmd.name()) {
+                    trimmed[parent_cmd.name().len()..].trim().to_lowercase()
+                } else {
+                    trimmed.trim_start_matches('/').to_lowercase()
+                };
+
+                let prefix_matches: Vec<PaletteItem> = subcommands
+                    .iter()
+                    .filter(|sub| {
+                        query.is_empty()
+                            || sub.name.to_lowercase().starts_with(&query)
+                            || sub
+                                .display_name
+                                .to_lowercase()
+                                .split_whitespace()
+                                .any(|w| w.starts_with(&query))
+                    })
+                    .map(|sub| PaletteItem {
+                        display_name: sub.display_name.clone(),
+                        description: sub.description.clone(),
+                        execution_text: sub.command_template.clone(),
+                        is_subcommand: true,
+                        has_subcommands: false,
+                        parent_command: Some(parent_cmd.name().to_string()),
+                        requires_args: sub.requires_args,
+                    })
+                    .collect();
+
+                if !prefix_matches.is_empty() {
+                    return prefix_matches;
+                }
+
+                let fallback_matches: Vec<PaletteItem> = subcommands
+                    .into_iter()
+                    .filter(|sub| {
+                        sub.name.to_lowercase().contains(&query)
+                            || sub.display_name.to_lowercase().contains(&query)
+                            || sub.command_template.to_lowercase().contains(&query)
+                    })
+                    .map(|sub| PaletteItem {
+                        display_name: sub.display_name,
+                        description: sub.description,
+                        execution_text: sub.command_template,
+                        is_subcommand: true,
+                        has_subcommands: false,
+                        parent_command: Some(parent_cmd.name().to_string()),
+                        requires_args: sub.requires_args,
+                    })
+                    .collect();
+
+                return fallback_matches;
+            }
+        }
+
+        // 2. Normal / Top-level filtering:
+        if trimmed.is_empty() || trimmed == "/" {
+            return self
+                .commands
+                .iter()
+                .map(|cmd| PaletteItem {
+                    display_name: cmd.name().to_string(),
+                    description: cmd.description().to_string(),
+                    execution_text: cmd.name().to_string(),
+                    is_subcommand: false,
+                    has_subcommands: !cmd.subcommands().is_empty(),
+                    parent_command: None,
+                    requires_args: false,
+                })
+                .collect();
+        }
+
+        let query = trimmed.to_lowercase();
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+
+        // 3. Check if first token matches a command that has subcommands:
+        if !tokens.is_empty() {
+            let first_token = tokens[0];
+            if let Some(cmd) = self.find(first_token) {
+                let subcommands = cmd.subcommands();
+                if !subcommands.is_empty() && (tokens.len() > 1 || input.ends_with(' ')) {
+                    let sub_token = tokens.get(1).copied().unwrap_or("");
+                    let sub_query = sub_token.to_lowercase();
+
+                    if tokens.len() > 2 {
+                        let desc = subcommands
+                            .iter()
+                            .find(|s| s.name.eq_ignore_ascii_case(sub_token))
+                            .map(|s| s.description.clone())
+                            .unwrap_or_else(|| format!("Execute: {}", trimmed));
+
+                        return vec![PaletteItem {
+                            display_name: trimmed.to_string(),
+                            description: desc,
+                            execution_text: trimmed.to_string(),
+                            is_subcommand: true,
+                            has_subcommands: false,
+                            parent_command: Some(cmd.name().to_string()),
+                            requires_args: false,
+                        }];
+                    }
+
+                    let matching_subs: Vec<PaletteItem> = subcommands
+                        .iter()
+                        .filter(|sub| {
+                            sub_query.is_empty()
+                                || sub.name.to_lowercase().starts_with(&sub_query)
+                                || sub
+                                    .display_name
+                                    .to_lowercase()
+                                    .split_whitespace()
+                                    .any(|w| w.starts_with(&sub_query))
+                        })
+                        .map(|sub| PaletteItem {
+                            display_name: format!("{} {}", cmd.name(), sub.name),
+                            description: sub.description.clone(),
+                            execution_text: sub.command_template.clone(),
+                            is_subcommand: true,
+                            has_subcommands: false,
+                            parent_command: Some(cmd.name().to_string()),
+                            requires_args: sub.requires_args,
+                        })
+                        .collect();
+
+                    if !matching_subs.is_empty() {
+                        return matching_subs;
+                    }
+
+                    return vec![PaletteItem {
+                        display_name: trimmed.to_string(),
+                        description: format!("Execute: {}", trimmed),
+                        execution_text: trimmed.to_string(),
+                        is_subcommand: true,
+                        has_subcommands: false,
+                        parent_command: Some(cmd.name().to_string()),
+                        requires_args: false,
+                    }];
+                }
+            }
+        }
+
+        // 4. Prefix match against top-level command names and aliases:
+        let mut prefix_matches = Vec::new();
+        for cmd in &self.commands {
+            let name_lower = cmd.name().to_lowercase();
+            let matches_name = name_lower.starts_with(&query);
+            let matches_alias = cmd
+                .aliases()
+                .iter()
+                .any(|a| a.to_lowercase().starts_with(&query));
+
+            if matches_name || matches_alias {
+                prefix_matches.push(PaletteItem {
+                    display_name: cmd.name().to_string(),
+                    description: cmd.description().to_string(),
+                    execution_text: cmd.name().to_string(),
+                    is_subcommand: false,
+                    has_subcommands: !cmd.subcommands().is_empty(),
+                    parent_command: None,
+                    requires_args: false,
+                });
+            }
+        }
+
+        if !prefix_matches.is_empty() {
+            return prefix_matches;
+        }
+
+        // 5. Fallback: substring matching on name or description
+        let clean_query = query.trim_start_matches('/');
+        let mut fallback_matches = Vec::new();
+        for cmd in &self.commands {
+            let name_lower = cmd.name().to_lowercase();
+            let desc_lower = cmd.description().to_lowercase();
+            if name_lower.contains(clean_query) || desc_lower.contains(clean_query) {
+                fallback_matches.push(PaletteItem {
+                    display_name: cmd.name().to_string(),
+                    description: cmd.description().to_string(),
+                    execution_text: cmd.name().to_string(),
+                    is_subcommand: false,
+                    has_subcommands: !cmd.subcommands().is_empty(),
+                    parent_command: None,
+                    requires_args: false,
+                });
+            }
+        }
+
+        if !fallback_matches.is_empty() {
+            return fallback_matches;
+        }
+
+        // 6. If user typed an arbitrary command string starting with '/':
+        if trimmed.starts_with('/') {
+            vec![PaletteItem {
+                display_name: trimmed.to_string(),
+                description: format!("Run command: {}", trimmed),
+                execution_text: trimmed.to_string(),
+                is_subcommand: false,
+                has_subcommands: false,
+                parent_command: None,
+                requires_args: false,
+            }]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Formats help entries for all registered commands.
@@ -1300,5 +1662,97 @@ impl CommandRegistry {
             Some(cmd) => cmd.execute(context),
             None => Err(CommandError::UnknownCommand(command_token.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_filter_palette_all_commands_on_empty_and_slash() {
+        let registry = CommandRegistry::with_defaults();
+        let items_empty = registry.filter_palette("", None);
+        let items_slash = registry.filter_palette("/", None);
+
+        assert_eq!(items_empty.len(), items_slash.len());
+        assert!(items_empty.iter().any(|i| i.execution_text == "/mcp"));
+        assert!(items_empty.iter().any(|i| i.execution_text == "/help"));
+        assert!(items_empty.iter().any(|i| i.execution_text == "/exit"));
+    }
+
+    #[test]
+    fn test_filter_palette_prefix_matching() {
+        let registry = CommandRegistry::with_defaults();
+
+        // Typing /m matches /model and /mcp
+        let items_m = registry.filter_palette("/m", None);
+        assert!(items_m.iter().any(|i| i.execution_text == "/mcp"));
+        assert!(items_m.iter().any(|i| i.execution_text == "/model"));
+
+        // Typing /mc matches only /mcp
+        let items_mc = registry.filter_palette("/mc", None);
+        assert_eq!(items_mc.len(), 1);
+        assert_eq!(items_mc[0].execution_text, "/mcp");
+        assert!(items_mc[0].has_subcommands);
+
+        // Typing /mcp matches /mcp
+        let items_mcp = registry.filter_palette("/mcp", None);
+        assert_eq!(items_mcp[0].execution_text, "/mcp");
+    }
+
+    #[test]
+    fn test_filter_palette_subcommand_inline_filtering() {
+        let registry = CommandRegistry::with_defaults();
+
+        // Typing /mcp a filters to /mcp add
+        let items_a = registry.filter_palette("/mcp a", None);
+        assert_eq!(items_a.len(), 1);
+        assert_eq!(items_a[0].execution_text, "/mcp add");
+        assert_eq!(items_a[0].display_name, "/mcp add");
+        assert!(!items_a[0].requires_args);
+
+        // Typing /mcp r filters to /mcp remove
+        let items_r = registry.filter_palette("/mcp r", None);
+        assert_eq!(items_r.len(), 1);
+        assert_eq!(items_r[0].execution_text, "/mcp remove ");
+        assert!(items_r[0].requires_args);
+
+        // Typing /mcp space lists all 4 subcommands
+        let items_space = registry.filter_palette("/mcp ", None);
+        assert_eq!(items_space.len(), 4);
+    }
+
+    #[test]
+    fn test_filter_palette_hierarchical_subcommand_mode() {
+        let registry = CommandRegistry::with_defaults();
+
+        // When user enters hierarchical mode for /mcp:
+        let subs = registry.filter_palette("/mcp", Some("/mcp"));
+        assert_eq!(subs.len(), 4);
+        assert_eq!(subs[0].display_name, "Add MCP server");
+        assert_eq!(subs[0].execution_text, "/mcp add");
+        assert_eq!(subs[1].display_name, "Remove MCP server");
+        assert_eq!(subs[2].display_name, "Test MCP server");
+        assert_eq!(subs[3].display_name, "List MCP servers");
+
+        // Filtering within hierarchical mode:
+        let subs_add = registry.filter_palette("add", Some("/mcp"));
+        assert_eq!(subs_add.len(), 1);
+        assert_eq!(subs_add[0].display_name, "Add MCP server");
+    }
+
+    #[test]
+    fn test_filter_palette_arguments_typing() {
+        let registry = CommandRegistry::with_defaults();
+
+        // Direct typing of command with arguments
+        let items_remove = registry.filter_palette("/mcp remove github", None);
+        assert_eq!(items_remove.len(), 1);
+        assert_eq!(items_remove[0].execution_text, "/mcp remove github");
+
+        let items_test = registry.filter_palette("/mcp test github", None);
+        assert_eq!(items_test.len(), 1);
+        assert_eq!(items_test[0].execution_text, "/mcp test github");
     }
 }
