@@ -57,6 +57,8 @@ pub struct HadesApp {
     orchestrator: hades_agent::AgentOrchestrator,
     browser_manager: Arc<hades_browser::BrowserManager>,
     notification_service: NotificationService,
+    smart_orchestrator: crate::orchestration::SmartContextOrchestrator,
+    last_request_plan: Option<crate::orchestration::RequestPlan>,
     version: &'static str,
 }
 
@@ -123,6 +125,8 @@ impl HadesApp {
             orchestrator,
             browser_manager,
             notification_service,
+            smart_orchestrator: crate::orchestration::SmartContextOrchestrator::new(),
+            last_request_plan: None,
             version: APP_VERSION,
         }
     }
@@ -515,6 +519,23 @@ impl HadesApp {
         self.browser_manager.clone()
     }
 
+    /// Returns the last smart orchestration request plan, if available.
+    pub fn last_request_plan(&self) -> Option<&crate::orchestration::RequestPlan> {
+        self.last_request_plan.as_ref()
+    }
+
+    /// Accessor for the smart context and tool orchestrator.
+    pub fn smart_orchestrator(&self) -> &crate::orchestration::SmartContextOrchestrator {
+        &self.smart_orchestrator
+    }
+
+    /// Mutable accessor for the smart context and tool orchestrator.
+    pub fn smart_orchestrator_mut(
+        &mut self,
+    ) -> &mut crate::orchestration::SmartContextOrchestrator {
+        &mut self.smart_orchestrator
+    }
+
     /// Synchronizes discovered MCP tools from active servers into the core tool registry.
     pub async fn sync_mcp_tools(&mut self) -> usize {
         let mcp_tools = self.mcp_manager.discover_all_tools().await;
@@ -891,6 +912,9 @@ impl HadesApp {
         let result = tool
             .execute(&call.id, call.arguments.clone(), &context)
             .await;
+
+        self.smart_orchestrator
+            .record_tool_execution(&call.tool_name);
 
         match result.status {
             ToolStatus::Success => {
@@ -1433,26 +1457,25 @@ impl HadesApp {
             let _ = self.session_repository.save_session(session).await;
         }
 
-        // 2. Build model-aware context with safe truncation
-        let system_prompt = self.build_system_prompt();
+        // 2. Orchestrate minimal context and tool capabilities
         let history = self
             .active_session
             .as_ref()
             .map(|s| s.messages.as_slice())
             .unwrap_or(&[]);
-        let (messages, report) =
-            self.context_manager
-                .build_context(history, &model_id, Some(&system_prompt), prompt)?;
 
-        if report.was_truncated {
-            self.event_bus.publish(HadesEvent::ContextTruncated {
-                timestamp: chrono::Utc::now(),
-                session_id: session_id.clone(),
-                total_messages: report.total_messages,
-                included_messages: report.included_messages,
-                estimated_tokens: report.estimated_input_tokens,
-            });
-        }
+        let tool_defs = self.tool_registry.list();
+        let active_mcp_servers = self.mcp_manager.active_server_names().await;
+        let orch = self.smart_orchestrator.orchestrate(
+            prompt,
+            history,
+            &tool_defs,
+            &active_mcp_servers,
+            &provider_id,
+            &model_id,
+            &self.workspace_info,
+        );
+        self.last_request_plan = Some(orch.plan.clone());
 
         let credential = self
             .credential_backend
@@ -1466,9 +1489,11 @@ impl HadesApp {
             model_id: model_id.clone(),
         });
 
-        let tools = self.provider_tool_definitions();
-        let mut request = CompletionRequest::single_prompt(&model_id, prompt).with_tools(tools);
-        request.messages = messages;
+        let mut request = CompletionRequest::single_prompt(&model_id, prompt);
+        if !orch.tools.is_empty() {
+            request = request.with_tools(orch.tools);
+        }
+        request.messages = orch.messages;
 
         let response = match self.model_manager.complete(request, &credential).await {
             Ok(resp) => resp,
@@ -1553,16 +1578,34 @@ impl HadesApp {
             let _ = self.session_repository.save_session(session).await;
         }
 
-        // 2. Build model-aware context with safe truncation
-        let system_prompt = self.build_system_prompt();
+        // 2. Orchestrate minimal context and tool capabilities
         let history = self
             .active_session
             .as_ref()
             .map(|s| s.messages.as_slice())
             .unwrap_or(&[]);
-        let (messages, report) =
-            self.context_manager
-                .build_context(history, &model_id, Some(&system_prompt), prompt)?;
+
+        let tool_defs = self.tool_registry.list();
+        let active_mcp_servers = self.mcp_manager.active_server_names().await;
+        let orch = self.smart_orchestrator.orchestrate(
+            prompt,
+            history,
+            &tool_defs,
+            &active_mcp_servers,
+            &provider_id,
+            &model_id,
+            &self.workspace_info,
+        );
+        self.last_request_plan = Some(orch.plan.clone());
+
+        let report = ContextReport {
+            total_messages: history.len(),
+            included_messages: orch.messages.len(),
+            estimated_input_tokens: orch.plan.estimated_total_tokens,
+            context_limit: orch.plan.token_budget,
+            output_reserve: 1500,
+            was_truncated: orch.plan.excluded_tools_count > 0,
+        };
 
         if report.was_truncated {
             self.event_bus.publish(HadesEvent::ContextTruncated {
@@ -1586,11 +1629,11 @@ impl HadesApp {
             model_id: model_id.clone(),
         });
 
-        let tools = self.provider_tool_definitions();
-        let mut request = CompletionRequest::single_prompt(&model_id, prompt)
-            .with_stream(true)
-            .with_tools(tools);
-        request.messages = messages;
+        let mut request = CompletionRequest::single_prompt(&model_id, prompt).with_stream(true);
+        if !orch.tools.is_empty() {
+            request = request.with_tools(orch.tools);
+        }
+        request.messages = orch.messages;
 
         let stream = match self
             .model_manager
@@ -1644,15 +1687,32 @@ impl HadesApp {
             .map(|s| s.metadata.id.clone())
             .unwrap_or_else(|| "default".to_string());
 
-        let system_prompt = self.build_system_prompt();
         let history = self
             .active_session
             .as_ref()
             .map(|s| s.messages.as_slice())
             .unwrap_or(&[]);
-        let (messages, report) =
-            self.context_manager
-                .build_context(history, &model_id, Some(&system_prompt), "")?;
+
+        let tool_defs = self.tool_registry.list();
+        let active_mcp_servers = self.mcp_manager.active_server_names().await;
+        let orch = self.smart_orchestrator.orchestrate_continuation(
+            history,
+            &tool_defs,
+            &active_mcp_servers,
+            &provider_id,
+            &model_id,
+            &self.workspace_info,
+        );
+        self.last_request_plan = Some(orch.plan.clone());
+
+        let report = ContextReport {
+            total_messages: history.len(),
+            included_messages: orch.messages.len(),
+            estimated_input_tokens: orch.plan.estimated_total_tokens,
+            context_limit: orch.plan.token_budget,
+            output_reserve: 1500,
+            was_truncated: false,
+        };
 
         let credential = self
             .credential_backend
@@ -1666,11 +1726,11 @@ impl HadesApp {
             model_id: model_id.clone(),
         });
 
-        let tools = self.provider_tool_definitions();
-        let mut request = CompletionRequest::single_prompt(&model_id, "")
-            .with_stream(true)
-            .with_tools(tools);
-        request.messages = messages;
+        let mut request = CompletionRequest::single_prompt(&model_id, "").with_stream(true);
+        if !orch.tools.is_empty() {
+            request = request.with_tools(orch.tools);
+        }
+        request.messages = orch.messages;
 
         let stream = match self
             .model_manager
@@ -1869,6 +1929,7 @@ impl HadesApp {
         .with_mcp_summaries(mcp_summaries)
         .with_browser(browser_status, Some(self.browser_manager.clone()))
         .with_active_session(self.active_session.as_ref())
+        .with_request_plan(self.last_request_plan.clone())
         .with_raw_input(input);
 
         let result = self.command_registry.execute(input, &mut context);

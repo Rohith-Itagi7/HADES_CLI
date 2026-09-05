@@ -264,6 +264,11 @@ impl McpServerManager {
         servers.get(name).cloned()
     }
 
+    /// Returns the names of all active running MCP servers.
+    pub async fn active_server_names(&self) -> Vec<String> {
+        self.servers.read().await.keys().cloned().collect()
+    }
+
     /// Returns a list of all configured server summaries.
     pub async fn list_server_summaries(&self) -> Vec<McpServerSummary> {
         let configs = self.configs.read().await.clone();

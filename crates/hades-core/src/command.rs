@@ -225,6 +225,7 @@ pub struct CommandContext<'a> {
     pub browser_manager: Option<Arc<hades_browser::BrowserManager>>,
     pub active_session: Option<&'a SessionRecord>,
     pub raw_input: String,
+    pub last_request_plan: Option<crate::orchestration::RequestPlan>,
 }
 
 impl<'a> CommandContext<'a> {
@@ -266,7 +267,14 @@ impl<'a> CommandContext<'a> {
             browser_manager: None,
             active_session: None,
             raw_input: String::new(),
+            last_request_plan: None,
         }
+    }
+
+    /// Attaches last smart orchestration request plan.
+    pub fn with_request_plan(mut self, plan: Option<crate::orchestration::RequestPlan>) -> Self {
+        self.last_request_plan = plan;
+        self
     }
 
     /// Sets the active session reference on the command context.
@@ -409,10 +417,21 @@ impl Command for StatusCommand {
         let model_display = context.active_model.unwrap_or("Not configured").to_string();
         let session_id_str = context.session_id.unwrap_or("None").to_string();
         let session_title_str = context.session_title.unwrap_or("None").to_string();
-        let context_usage_str = context
-            .context_usage
-            .clone()
-            .unwrap_or_else(|| "0 / 32,768 (Estimated)".to_string());
+        let context_usage_str = if let Some(ref plan) = context.last_request_plan {
+            format!(
+                "{} / {} tokens (Tier {}, {} selected, {} excluded)",
+                plan.estimated_total_tokens,
+                plan.token_budget,
+                plan.selection_tier,
+                plan.selected_tools.len(),
+                plan.excluded_tools_count
+            )
+        } else {
+            context
+                .context_usage
+                .clone()
+                .unwrap_or_else(|| "0 / 32,768 (Estimated)".to_string())
+        };
 
         let status = StatusInfo {
             application: "Running".to_string(),
@@ -428,6 +447,87 @@ impl Command for StatusCommand {
         };
 
         Ok(CommandOutput::Status(status))
+    }
+}
+
+/// Command: `/debug`
+pub struct DebugCommand;
+
+impl Command for DebugCommand {
+    fn name(&self) -> &'static str {
+        "/debug"
+    }
+
+    fn description(&self) -> &'static str {
+        "Show smart context orchestration diagnostics and token budget plans"
+    }
+
+    fn subcommands(&self) -> Vec<SubcommandInfo> {
+        vec![SubcommandInfo {
+            name: "context".to_string(),
+            description: "Inspect token budget, capability index, and last request plan"
+                .to_string(),
+            display_name: "context".to_string(),
+            command_template: "/debug context".to_string(),
+            requires_args: false,
+        }]
+    }
+
+    fn execute(&self, context: &mut CommandContext) -> Result<CommandOutput, CommandError> {
+        let mut out = String::from("HADES SMART CONTEXT & TOOL ORCHESTRATION\n\n");
+        if let Some(ref plan) = context.last_request_plan {
+            out.push_str(&format!("Task Domain:    {}\n", plan.task_domain));
+            out.push_str(&format!("Selection Tier: Tier {}\n", plan.selection_tier));
+            out.push_str(&format!("Reasoning:      {}\n\n", plan.reasoning));
+            out.push_str("Token Budget & Estimates:\n");
+            out.push_str(&format!(
+                "  Estimated Total:   {} tokens\n",
+                plan.estimated_total_tokens
+            ));
+            out.push_str(&format!(
+                "  System Prompt:     {} tokens\n",
+                plan.estimated_system_tokens
+            ));
+            out.push_str(&format!(
+                "  Context Messages:  {} tokens\n",
+                plan.estimated_context_tokens
+            ));
+            out.push_str(&format!(
+                "  Tool Schemas:      {} tokens\n",
+                plan.estimated_tool_tokens
+            ));
+            out.push_str(&format!(
+                "  Available Budget:  {} tokens\n",
+                plan.token_budget
+            ));
+            if let Some(tpm) = plan.provider_tpm_limit {
+                out.push_str(&format!("  Provider TPM:      {} TPM\n", tpm));
+            }
+            out.push_str("\nTool Capability Selection:\n");
+            out.push_str(&format!(
+                "  Total Available:   {} tools\n",
+                plan.available_tools_count
+            ));
+            out.push_str(&format!(
+                "  Selected:          {} tools\n",
+                plan.selected_tools.len()
+            ));
+            for t in &plan.selected_tools {
+                out.push_str(&format!("    • {t}\n"));
+            }
+            out.push_str(&format!(
+                "  Excluded:          {} irrelevant tools (schemas omitted)\n",
+                plan.excluded_tools_count
+            ));
+        } else {
+            out.push_str("No model request has been executed in the active session yet.\n\n");
+            let tool_count = context.tool_registry.map(|r| r.count()).unwrap_or(0);
+            out.push_str(&format!("Available Registered Tools: {}\n", tool_count));
+            let mcp_count = context.mcp_summaries.len();
+            out.push_str(&format!("Configured MCP Servers:     {}\n", mcp_count));
+        }
+
+        Ok(CommandOutput::Text(out))
     }
 }
 
@@ -1349,6 +1449,7 @@ impl CommandRegistry {
         let mut registry = Self::new();
         registry.register(HelpCommand);
         registry.register(StatusCommand);
+        registry.register(DebugCommand);
         registry.register(ModelCommand);
         registry.register(SwitchCommand);
         registry.register(NewSessionCommand);

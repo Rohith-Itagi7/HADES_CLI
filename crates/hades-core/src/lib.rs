@@ -3,19 +3,25 @@ pub mod command;
 pub mod context;
 pub mod error;
 pub mod notification;
+pub mod orchestration;
 pub mod state;
 
 pub use app::{HadesApp, APP_VERSION};
 pub use command::{
-    Command, CommandContext, CommandInfo, CommandOutput, CommandRegistry, ExitCommand,
-    ExportCommand, HelpCommand, HelpEntry, ImportCommand, ModelCommand, NewSessionCommand,
-    NotifyCommand, PaletteItem, SessionsCommand, StatusCommand, StatusInfo, SubcommandInfo,
-    SwitchCommand,
+    Command, CommandContext, CommandInfo, CommandOutput, CommandRegistry, DebugCommand,
+    ExitCommand, ExportCommand, HelpCommand, HelpEntry, ImportCommand, ModelCommand,
+    NewSessionCommand, NotifyCommand, PaletteItem, SessionsCommand, StatusCommand, StatusInfo,
+    SubcommandInfo, SwitchCommand,
 };
 
 pub use context::{ContextManager, ContextReport, TokenEstimator, UsageKind};
 pub use error::{CommandError, CoreError};
 pub use notification::{NotificationKind, NotificationService, SoundPlayer};
+pub use orchestration::{
+    CapabilityIndex, OrchestrationResult, ProviderTokenProfile, RequestPlan, SmartContextBuilder,
+    SmartContextOrchestrator, TaskDomain, TaskIntent, TaskIntentAnalyzer, TokenBudgetManager,
+    ToolMetadata, ToolRelevanceEngine, ToolSelectionResult, ToolSource,
+};
 pub use state::AppState;
 
 #[cfg(test)]
