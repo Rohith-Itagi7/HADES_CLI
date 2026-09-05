@@ -519,6 +519,33 @@ impl Command for DebugCommand {
                 "  Excluded:          {} irrelevant tools (schemas omitted)\n",
                 plan.excluded_tools_count
             ));
+            out.push_str("\nProvider Request Telemetry:\n");
+            out.push_str(&format!("  Provider:          {}\n", plan.provider_id));
+            out.push_str(&format!("  Model:             {}\n", plan.model_id));
+            out.push_str(&format!("  Messages Count:    {}\n", plan.message_count));
+            out.push_str(&format!(
+                "  Tools Attached:    {}\n",
+                plan.selected_tools.len()
+            ));
+            out.push_str(&format!(
+                "  Max Tokens Reserve:{} tokens\n",
+                plan.max_tokens_reserve
+            ));
+            if plan.serialized_request_bytes > 0 {
+                out.push_str(&format!(
+                    "  Serialized Payload:{} bytes\n",
+                    plan.serialized_request_bytes
+                ));
+            }
+            if let Some(tpm) = plan.provider_tpm_limit {
+                let calculated_tpm = plan.estimated_total_tokens + plan.max_tokens_reserve;
+                out.push_str(&format!(
+                    "  TPM Constraint:    {} TPM (Calculated Request: {} tokens)\n",
+                    tpm, calculated_tpm
+                ));
+            } else {
+                out.push_str("  TPM Constraint:    None (Context Window constrained)\n");
+            }
         } else {
             out.push_str("No model request has been executed in the active session yet.\n\n");
             let tool_count = context.tool_registry.map(|r| r.count()).unwrap_or(0);

@@ -29,6 +29,11 @@ pub struct RequestPlan {
     pub provider_tpm_limit: Option<usize>,
     pub selection_tier: usize,
     pub reasoning: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub message_count: usize,
+    pub max_tokens_reserve: usize,
+    pub serialized_request_bytes: usize,
 }
 
 /// Outcome of the smart orchestration pipeline ready to feed into `CompletionRequest`.
@@ -185,6 +190,11 @@ impl SmartContextOrchestrator {
             provider_tpm_limit: profile.tpm_limit,
             selection_tier: selection.tier,
             reasoning: selection.reasoning,
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            message_count: messages.len(),
+            max_tokens_reserve: profile.output_reserve,
+            serialized_request_bytes: 0,
         };
 
         OrchestrationResult {
@@ -229,18 +239,9 @@ impl SmartContextOrchestrator {
         let profile = ProviderTokenProfile::for_model(provider_id, model_id, None);
 
         // Continuation tool selection:
-        // If summarization turn, expose only continuation read tools or 0 tools if the answer is ready
+        // For summarization turn, expose 0 tools and 0 schema tokens so the model formulates its answer cleanly without tool schema overhead.
         let (selected_tools, schema_tokens) = if is_summarization_turn {
-            // Keep at most 2 relevant continuation tools
-            let mut tools = Vec::new();
-            let mut tokens = 0;
-            if let Some(ref name) = last_tool_call_name {
-                if let Some(m) = index.get(name) {
-                    tools.push(name.clone());
-                    tokens += m.estimated_schema_tokens;
-                }
-            }
-            (tools, tokens)
+            (Vec::new(), 0)
         } else {
             // Re-evaluate with previous tools
             let intent = TaskIntentAnalyzer::analyze(
@@ -294,10 +295,20 @@ impl SmartContextOrchestrator {
             token_budget: profile.max_request_input_tokens,
             provider_tpm_limit: profile.tpm_limit,
             selection_tier: if selected_tools.is_empty() { 0 } else { 1 },
-            reasoning: format!(
-                "Continuation turn: {} tool(s) attached.",
-                selected_tools.len()
-            ),
+            reasoning: if is_summarization_turn {
+                "Continuation turn: Tool result ready. 0 tools attached for summarization response."
+                    .to_string()
+            } else {
+                format!(
+                    "Continuation turn: {} tool(s) attached.",
+                    selected_tools.len()
+                )
+            },
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            message_count: messages.len(),
+            max_tokens_reserve: profile.output_reserve,
+            serialized_request_bytes: 0,
         };
 
         OrchestrationResult {

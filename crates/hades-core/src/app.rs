@@ -554,14 +554,21 @@ impl HadesApp {
         Ok(())
     }
 
+    /// Resets the tool registry with all native built-in tools (29 core + 22 browser tools).
+    pub fn reset_native_tools(&mut self) {
+        let mut registry = ToolRegistry::default_registry();
+        hades_browser::BrowserToolSet::register_all(&mut registry, self.browser_manager.clone());
+        self.tool_registry = registry;
+    }
+
     /// Disconnects a named MCP server and refreshes the tool registry.
     pub async fn disconnect_mcp_server(&mut self, server_name: &str) -> Result<(), CoreError> {
         self.mcp_manager
             .stop_server(server_name)
             .await
             .map_err(|e| CoreError::Runtime(e.to_string()))?;
-        // Reset to default native tools + remaining MCP tools
-        self.tool_registry = ToolRegistry::default_registry();
+        // Reset to default native tools (29 core + 22 browser) + remaining MCP tools
+        self.reset_native_tools();
         self.sync_mcp_tools().await;
         Ok(())
     }
@@ -654,7 +661,7 @@ impl HadesApp {
         self.mcp_manager.remove_server_config(name).await;
         self.delete_mcp_auth_token(name).await?;
 
-        self.tool_registry = ToolRegistry::default_registry();
+        self.reset_native_tools();
         self.sync_mcp_tools().await;
         Ok(())
     }
@@ -1495,6 +1502,33 @@ impl HadesApp {
         }
         request.messages = orch.messages;
 
+        // Calculate bounded max_tokens to strictly respect TPM limits and prevent rate limiter overestimation
+        let allowed_output = if let Some(tpm) = orch.plan.provider_tpm_limit {
+            let rem = tpm.saturating_sub(orch.plan.estimated_total_tokens);
+            orch.plan.max_tokens_reserve.min(rem).max(256)
+        } else {
+            orch.plan.max_tokens_reserve
+        };
+        request.max_tokens = Some(allowed_output as u32);
+
+        let serialized_bytes = serde_json::to_vec(&request).map(|b| b.len()).unwrap_or(0);
+        if let Some(ref mut p) = self.last_request_plan {
+            p.max_tokens_reserve = allowed_output;
+            p.serialized_request_bytes = serialized_bytes;
+        }
+
+        tracing::info!(
+            target: "orchestrator",
+            provider = %provider_id,
+            model = %model_id,
+            messages = request.messages.len(),
+            tools = request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            max_tokens = allowed_output,
+            serialized_bytes = serialized_bytes,
+            tpm_limit = ?orch.plan.provider_tpm_limit,
+            "Dispatched model completion request"
+        );
+
         let response = match self.model_manager.complete(request, &credential).await {
             Ok(resp) => resp,
             Err(e) => {
@@ -1635,6 +1669,33 @@ impl HadesApp {
         }
         request.messages = orch.messages;
 
+        // Calculate bounded max_tokens to strictly respect TPM limits and prevent rate limiter overestimation
+        let allowed_output = if let Some(tpm) = orch.plan.provider_tpm_limit {
+            let rem = tpm.saturating_sub(orch.plan.estimated_total_tokens);
+            orch.plan.max_tokens_reserve.min(rem).max(256)
+        } else {
+            orch.plan.max_tokens_reserve
+        };
+        request.max_tokens = Some(allowed_output as u32);
+
+        let serialized_bytes = serde_json::to_vec(&request).map(|b| b.len()).unwrap_or(0);
+        if let Some(ref mut p) = self.last_request_plan {
+            p.max_tokens_reserve = allowed_output;
+            p.serialized_request_bytes = serialized_bytes;
+        }
+
+        tracing::info!(
+            target: "orchestrator",
+            provider = %provider_id,
+            model = %model_id,
+            messages = request.messages.len(),
+            tools = request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            max_tokens = allowed_output,
+            serialized_bytes = serialized_bytes,
+            tpm_limit = ?orch.plan.provider_tpm_limit,
+            "Dispatched model streaming request"
+        );
+
         let stream = match self
             .model_manager
             .complete_stream(request, &credential)
@@ -1731,6 +1792,33 @@ impl HadesApp {
             request = request.with_tools(orch.tools);
         }
         request.messages = orch.messages;
+
+        // Calculate bounded max_tokens to strictly respect TPM limits and prevent rate limiter overestimation
+        let allowed_output = if let Some(tpm) = orch.plan.provider_tpm_limit {
+            let rem = tpm.saturating_sub(orch.plan.estimated_total_tokens);
+            orch.plan.max_tokens_reserve.min(rem).max(256)
+        } else {
+            orch.plan.max_tokens_reserve
+        };
+        request.max_tokens = Some(allowed_output as u32);
+
+        let serialized_bytes = serde_json::to_vec(&request).map(|b| b.len()).unwrap_or(0);
+        if let Some(ref mut p) = self.last_request_plan {
+            p.max_tokens_reserve = allowed_output;
+            p.serialized_request_bytes = serialized_bytes;
+        }
+
+        tracing::info!(
+            target: "orchestrator",
+            provider = %provider_id,
+            model = %model_id,
+            messages = request.messages.len(),
+            tools = request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            max_tokens = allowed_output,
+            serialized_bytes = serialized_bytes,
+            tpm_limit = ?orch.plan.provider_tpm_limit,
+            "Dispatched continuation streaming request"
+        );
 
         let stream = match self
             .model_manager
