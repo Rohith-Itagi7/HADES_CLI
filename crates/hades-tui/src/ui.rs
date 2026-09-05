@@ -95,6 +95,7 @@ pub fn render(frame: &mut Frame, app: &HadesApp, state: &mut TuiState) {
         AppState::VerificationFailed => render_verification_failed(frame, state, size),
         AppState::ToolApproval => render_tool_approval(frame, app, state, size),
         AppState::CopySelect => render_copy_select(frame, state, size),
+        AppState::McpSetup => render_mcp_setup(frame, state, size),
         _ => {}
     }
 }
@@ -1557,4 +1558,171 @@ fn render_tool_approval(frame: &mut Frame, app: &HadesApp, state: &TuiState, are
 
     let button_para = Paragraph::new(vec![button_line, nav_hint]).alignment(Alignment::Center);
     frame.render_widget(button_para, chunks[3]);
+}
+
+fn render_mcp_setup(frame: &mut Frame, state: &TuiState, area: Rect) {
+    // Create a centered modal for MCP server setup
+    let modal = Rect {
+        x: area.x + area.width.saturating_sub(80) / 2,
+        y: area.y + area.height.saturating_sub(20) / 2,
+        width: 80,
+        height: 20,
+    };
+
+    // Background
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .style(Style::default().bg(Color::Black).fg(Color::White))
+            .title("Add MCP Server"),
+        modal,
+    );
+
+    let inner = Rect {
+        x: modal.x + 1,
+        y: modal.y + 1,
+        width: modal.width.saturating_sub(2),
+        height: modal.height.saturating_sub(2),
+    };
+
+    // Split into field areas
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints(vec![
+            Constraint::Length(2), // Server name
+            Constraint::Length(2), // Transport
+            Constraint::Length(2), // Command/URL
+            Constraint::Length(2), // Args
+            Constraint::Length(2), // Secure token
+            Constraint::Length(2), // Token environment variable
+            Constraint::Min(0),    // Error message
+        ])
+        .split(inner);
+
+    // Helper to render input field
+    let render_field = |frame: &mut Frame,
+                        idx: usize,
+                        label: &str,
+                        value: &str,
+                        _cursor_pos: usize,
+                        is_active: bool| {
+        let style = if is_active {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        let text = if is_active {
+            format!("{} {}_", label, value)
+        } else {
+            format!("{} {}", label, value)
+        };
+
+        frame.render_widget(Paragraph::new(text).style(style), chunks[idx]);
+    };
+
+    // Render fields
+    render_field(
+        frame,
+        0,
+        "Name:",
+        &state.mcp_server_name,
+        state.mcp_server_cursor_position,
+        state.mcp_current_field == 0,
+    );
+
+    // Transport selector
+    let transport_text = format!(
+        "Transport: [{}] {}",
+        if state.mcp_transport_selection == 0 {
+            "●"
+        } else {
+            "○"
+        },
+        if state.mcp_transport_selection == 0 {
+            "STDIO"
+        } else {
+            "HTTP"
+        }
+    );
+    let transport_style = if state.mcp_current_field == 1 {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    frame.render_widget(
+        Paragraph::new(transport_text).style(transport_style),
+        chunks[1],
+    );
+
+    // Command/URL field
+    let cmd_label = if state.mcp_transport_selection == 0 {
+        "Command:"
+    } else {
+        "URL:"
+    };
+    let cmd_value = if state.mcp_transport_selection == 0 {
+        &state.mcp_command_input
+    } else {
+        &state.mcp_url_input
+    };
+    render_field(
+        frame,
+        2,
+        cmd_label,
+        cmd_value,
+        if state.mcp_transport_selection == 0 {
+            state.mcp_command_cursor_position
+        } else {
+            state.mcp_url_cursor_position
+        },
+        state.mcp_current_field == 2,
+    );
+
+    // Args field
+    render_field(
+        frame,
+        3,
+        "Args:",
+        &state.mcp_args_input,
+        state.mcp_args_cursor_position,
+        state.mcp_current_field == 3,
+    );
+
+    // Secure token field. The value is masked before rendering.
+    let masked_token = "*".repeat(state.mcp_auth_token_input.chars().count());
+    render_field(
+        frame,
+        4,
+        "Token (secure):",
+        &masked_token,
+        state.mcp_auth_token_cursor_position,
+        state.mcp_current_field == 4,
+    );
+
+    // Token environment variable fallback.
+    render_field(
+        frame,
+        5,
+        "Token env:",
+        &state.mcp_token_env_input,
+        state.mcp_token_env_cursor_position,
+        state.mcp_current_field == 5,
+    );
+
+    // Error message or help text
+    let error_text = if let Some(err) = &state.mcp_setup_error {
+        Span::styled(format!("✗ {}", err), Style::default().fg(Color::Red))
+    } else {
+        Span::styled(
+            "Tab/↑↓ to navigate, Left/Right on Transport, Enter to save, Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )
+    };
+    frame.render_widget(Paragraph::new(Line::from(error_text)), chunks[6]);
 }

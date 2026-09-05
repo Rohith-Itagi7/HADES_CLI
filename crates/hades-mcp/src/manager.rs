@@ -8,7 +8,7 @@ use hades_events::EventBus;
 use hades_tools::DynTool;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::client::{McpClient, McpServerState};
 use crate::error::McpError;
@@ -16,7 +16,7 @@ use crate::protocol::{
     GetPromptResult, McpPrompt, McpResource, McpToolDefinition, ReadResourceResult,
 };
 use crate::tool_adapter::McpToolAdapter;
-use crate::transport::{HttpTransport, McpTransport, StdioTransport};
+use crate::transport::{HttpTransport, McpTransport, SseTransport, StdioTransport};
 
 /// High-level diagnostic summary of an MCP server for status inspection and TUI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,21 +82,34 @@ impl McpServerManager {
         );
     }
 
-    /// Initializes and connects all enabled and auto-start configured servers.
-    pub async fn auto_start_servers(&self) {
+    /// Adds or updates a server configuration in the running manager.
+    pub async fn upsert_server_config(&self, name: impl Into<String>, config: McpServerConfig) {
+        self.configs.write().await.insert(name.into(), config);
+    }
+
+    /// Removes a server configuration from the running manager.
+    pub async fn remove_server_config(&self, name: &str) -> Option<McpServerConfig> {
+        self.configs.write().await.remove(name)
+    }
+
+    /// Returns enabled server names configured to auto-start.
+    pub async fn auto_start_server_names(&self) -> Vec<String> {
         let configs = self.configs.read().await.clone();
-        for (name, cfg) in configs {
-            if cfg.enabled && cfg.auto_start {
-                info!(server = %name, "Auto-starting MCP server");
-                if let Err(e) = self.start_server(&name).await {
-                    error!(server = %name, error = %e, "Failed to auto-start MCP server");
-                }
-            }
-        }
+        configs
+            .into_iter()
+            .filter_map(|(name, cfg)| (cfg.enabled && cfg.auto_start).then_some(name))
+            .collect()
     }
 
     /// Starts and initializes an MCP server by name.
-    pub async fn start_server(&self, name: &str) -> Result<Arc<McpClient>, McpError> {
+    ///
+    /// An explicitly supplied token takes precedence over `token_env`. The token is
+    /// ephemeral and is never retained in the server configuration.
+    pub async fn start_server(
+        &self,
+        name: &str,
+        auth_token: Option<&str>,
+    ) -> Result<Arc<McpClient>, McpError> {
         let cfg = {
             let configs = self.configs.read().await;
             configs.get(name).cloned().ok_or_else(|| {
@@ -121,12 +134,19 @@ impl McpServerManager {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        if let Some(ref token_env_var) = cfg.token_env {
-            if let Ok(val) = std::env::var(token_env_var) {
-                if !val.trim().is_empty() {
-                    env_map.insert(token_env_var.clone(), val);
-                }
-            }
+        let auth_token = auth_token
+            .filter(|token| !token.trim().is_empty())
+            .map(str::trim)
+            .map(str::to_string)
+            .or_else(|| {
+                cfg.token_env.as_ref().and_then(|token_env_var| {
+                    std::env::var(token_env_var)
+                        .ok()
+                        .filter(|token| !token.trim().is_empty())
+                })
+            });
+        if let (Some(token_env_var), Some(token)) = (&cfg.token_env, &auth_token) {
+            env_map.insert(token_env_var.clone(), token.clone());
         }
 
         let transport: Arc<dyn McpTransport> = match cfg.transport {
@@ -155,17 +175,26 @@ impl McpServerManager {
                 })?;
 
                 let mut headers = HashMap::new();
-                if let Some(ref token_env_var) = cfg.token_env {
-                    if let Ok(token) = std::env::var(token_env_var) {
-                        headers.insert(
-                            "Authorization".to_string(),
-                            format!("Bearer {}", token.trim()),
-                        );
-                    }
+                if let Some(token) = &auth_token {
+                    headers.insert("Authorization".to_string(), format!("Bearer {token}"));
                 }
 
                 let http = HttpTransport::new(name, url, headers);
                 Arc::new(http)
+            }
+            McpTransportType::Sse => {
+                let url = cfg.url.as_deref().ok_or_else(|| {
+                    McpError::Configuration(format!(
+                        "Server '{name}' missing 'url' for SSE transport"
+                    ))
+                })?;
+                let mut headers = HashMap::new();
+                if let Some(token) = &auth_token {
+                    headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+                }
+
+                let sse = SseTransport::connect(name, url, headers, timeout).await?;
+                Arc::new(sse)
             }
         };
 
@@ -226,7 +255,7 @@ impl McpServerManager {
     /// Restarts an MCP server.
     pub async fn restart_server(&self, name: &str) -> Result<Arc<McpClient>, McpError> {
         self.stop_server(name).await?;
-        self.start_server(name).await
+        self.start_server(name, None).await
     }
 
     /// Retrieves an active MCP client instance if connected.
@@ -262,6 +291,7 @@ impl McpServerManager {
             let transport_str = match cfg.transport {
                 McpTransportType::Stdio => "stdio".to_string(),
                 McpTransportType::Http => "http".to_string(),
+                McpTransportType::Sse => "sse".to_string(),
             };
 
             let tool_count = tools.get(&name).map(|t| t.len()).unwrap_or(0);

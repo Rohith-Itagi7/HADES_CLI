@@ -82,6 +82,15 @@ pub enum CommandOutput {
     /// Successful import of session transcript.
     ImportSuccess(Box<SessionRecord>),
 
+    /// Signal to open the interactive MCP server setup workflow.
+    OpenMcpSetup,
+
+    /// Remove an MCP server from configuration.
+    RemoveMcpServer(String),
+
+    /// Test connection to an MCP server.
+    TestMcpServer(String),
+
     /// Application exit signal.
     Exit,
 }
@@ -138,6 +147,9 @@ impl fmt::Display for CommandOutput {
                 record.metadata.title,
                 record.messages.len()
             ),
+            Self::OpenMcpSetup => write!(f, "Opening MCP server configuration..."),
+            Self::RemoveMcpServer(name) => write!(f, "Removing MCP server '{}'...", name),
+            Self::TestMcpServer(name) => write!(f, "Testing MCP server '{}'...", name),
             Self::Exit => write!(f, "Exiting Hades..."),
         }
     }
@@ -652,11 +664,65 @@ impl Command for McpCommand {
     }
 
     fn execute(&self, context: &mut CommandContext) -> Result<CommandOutput, CommandError> {
+        let trimmed = context.raw_input.trim();
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+
+        // Parse subcommands: /mcp [add|remove|test|list]
+        if tokens.len() > 1 {
+            match tokens[1].to_lowercase().as_str() {
+                "add" => {
+                    return Ok(CommandOutput::OpenMcpSetup);
+                }
+                "remove" => {
+                    if tokens.len() < 3 {
+                        return Ok(CommandOutput::Text(
+                            "Usage: /mcp remove <server_name>\nExample: /mcp remove github"
+                                .to_string(),
+                        ));
+                    }
+                    let server_name = tokens[2];
+
+                    // Check if server exists
+                    if !context.mcp_summaries.iter().any(|s| s.name == server_name) {
+                        return Ok(CommandOutput::Text(format!(
+                            "Error: MCP server '{}' is not configured.",
+                            server_name
+                        )));
+                    }
+
+                    // Return command output for async removal handling
+                    return Ok(CommandOutput::RemoveMcpServer(server_name.to_string()));
+                }
+                "test" => {
+                    if tokens.len() < 3 {
+                        return Ok(CommandOutput::Text(
+                            "Usage: /mcp test <server_name>\nExample: /mcp test github".to_string(),
+                        ));
+                    }
+                    let server_name = tokens[2];
+
+                    if !context.mcp_summaries.iter().any(|s| s.name == server_name) {
+                        return Ok(CommandOutput::Text(format!(
+                            "Error: MCP server '{}' is not configured.",
+                            server_name
+                        )));
+                    }
+
+                    return Ok(CommandOutput::TestMcpServer(server_name.to_string()));
+                }
+                _ => {
+                    // Fall through to list behavior
+                }
+            }
+        }
+
+        // Default: list all servers
         let mut output = String::from("MODEL CONTEXT PROTOCOL (MCP) SERVERS\n\n");
 
         if context.mcp_summaries.is_empty() {
             output.push_str("No MCP servers configured.\n\n");
-            output.push_str("To configure an MCP server, add it to your config.toml:\n");
+            output.push_str("To add an MCP server interactively, use: /mcp add\n\n");
+            output.push_str("Or configure in your config.toml (~/.hades/config.toml):\n");
             output.push_str("  [mcp.servers.github]\n");
             output.push_str("  transport = \"stdio\"\n");
             output.push_str("  command = \"npx\"\n");
@@ -711,6 +777,12 @@ impl Command for McpCommand {
                 }
             }
         }
+
+        output.push_str("\nUsage:\n");
+        output.push_str("  /mcp list         Show configured MCP servers\n");
+        output.push_str("  /mcp add          Add a new MCP server interactively\n");
+        output.push_str("  /mcp remove <name> Remove an MCP server\n");
+        output.push_str("  /mcp test <name>  Test connection to MCP server\n");
 
         Ok(CommandOutput::Text(output))
     }
@@ -907,13 +979,17 @@ impl Command for AgentsCommand {
             hades_agent::AgentRole::GeneralSpecialist,
         ];
 
-        for r in roles {
+        for role in roles {
             output.push_str(&format!(
                 "  {:<20} {:<8} {:<10} {}\n",
-                r.name(),
-                if r.is_mutating_allowed() { "Yes" } else { "No" },
-                format!("{}s", r.default_timeout_secs()),
-                r.description()
+                role.name(),
+                if role.is_mutating_allowed() {
+                    "Yes"
+                } else {
+                    "No"
+                },
+                format!("{}s", role.default_timeout_secs()),
+                role.description()
             ));
         }
 
@@ -928,7 +1004,9 @@ impl Command for AgentsCommand {
         output.push_str(
             "  - Plan & Execute:   Upfront planning -> Subtask execution -> Primary synthesis\n",
         );
-        output.push_str("  - Review & Refine:  Implementation -> Independent peer audit -> Primary synthesis\n\n");
+        output.push_str(
+            "  - Review & Refine:  Implementation -> Independent peer audit -> Primary synthesis\n\n",
+        );
         output.push_str("Commands:\n");
         output.push_str("  /agents                   List available roles & strategies\n");
         output.push_str("  /agents plan <objective>  Formulate and inspect a multi-agent plan\n");

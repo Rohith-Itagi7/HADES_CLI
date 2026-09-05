@@ -321,6 +321,7 @@ pub enum McpTransportType {
     #[default]
     Stdio,
     Http,
+    Sse,
 }
 
 fn default_server_enabled() -> bool {
@@ -338,7 +339,7 @@ fn default_mcp_timeout() -> u64 {
 /// Configuration for an individual MCP server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerConfig {
-    /// Transport mechanism (stdio or http).
+    /// Transport mechanism (stdio, http, or sse).
     #[serde(default)]
     pub transport: McpTransportType,
 
@@ -408,7 +409,7 @@ impl McpServerConfig {
                     }
                 }
             }
-            McpTransportType::Http => {
+            McpTransportType::Http | McpTransportType::Sse => {
                 if let Some(ref u) = self.url {
                     if u.trim().is_empty() {
                         return Err(ConfigError::Validation(format!(

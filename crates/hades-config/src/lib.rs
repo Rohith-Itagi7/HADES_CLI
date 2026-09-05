@@ -54,6 +54,33 @@ mod tests {
     }
 
     #[test]
+    fn test_sse_mcp_transport_roundtrip() {
+        let dir = tempdir().expect("create temp dir");
+        let config_path = dir.path().join("config.toml");
+        let service = ConfigService::with_path(&config_path);
+        let mut config = HadesConfig::default();
+        config.mcp.servers.insert(
+            "remote".to_string(),
+            McpServerConfig {
+                transport: McpTransportType::Sse,
+                url: Some("https://example.com/sse".to_string()),
+                ..Default::default()
+            },
+        );
+
+        service.save(&config).expect("save config");
+        assert!(std::fs::read_to_string(&config_path)
+            .expect("read config")
+            .contains("transport = \"sse\""));
+
+        let loaded = service.load().expect("load config");
+        assert_eq!(
+            loaded.mcp.servers["remote"].transport,
+            McpTransportType::Sse
+        );
+    }
+
+    #[test]
     fn test_load_or_create_missing() {
         let dir = tempdir().expect("create temp dir");
         let config_path = dir.path().join("sub").join("config.toml");

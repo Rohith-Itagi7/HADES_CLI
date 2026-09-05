@@ -150,6 +150,120 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_add_command_opens_setup() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+        state.prompt_input = "/mcp add".to_string();
+
+        let action = InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state)
+            .expect("submit MCP add command");
+
+        assert_eq!(action, KeyActionResult::Handled);
+        assert_eq!(app.state(), AppState::McpSetup);
+    }
+
+    #[test]
+    fn test_mcp_add_command_submits_server_configuration_action() {
+        let (mut app, _dir) = create_test_app();
+        let mut state = TuiState::new();
+        state.prompt_input = "/mcp add".to_string();
+
+        InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state)
+            .expect("open MCP setup");
+        assert_eq!(app.state(), AppState::McpSetup);
+
+        state.mcp_server_name = "github".to_string();
+        state.mcp_server_cursor_position = state.mcp_server_name.len();
+        state.mcp_command_input = "npx".to_string();
+        state.mcp_command_cursor_position = state.mcp_command_input.len();
+        state.mcp_args_input = "-y @modelcontextprotocol/server-github".to_string();
+        state.mcp_args_cursor_position = state.mcp_args_input.len();
+        state.mcp_auth_token_input = "test-mcp-token".to_string();
+        state.mcp_auth_token_cursor_position = state.mcp_auth_token_input.len();
+        state.mcp_token_env_input = "GITHUB_TOKEN".to_string();
+        state.mcp_token_env_cursor_position = state.mcp_token_env_input.len();
+
+        let action = InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state)
+            .expect("submit MCP setup");
+
+        assert_eq!(
+            action,
+            KeyActionResult::AddMcpServer {
+                name: "github".to_string(),
+                transport: "stdio".to_string(),
+                command_or_url: "npx".to_string(),
+                args: "-y @modelcontextprotocol/server-github".to_string(),
+                auth_token: "test-mcp-token".to_string(),
+                token_env: "GITHUB_TOKEN".to_string(),
+            }
+        );
+        assert_eq!(app.state(), AppState::Running);
+    }
+
+    #[test]
+    fn test_mcp_test_command_routes_to_live_test_action() {
+        let dir = tempdir().expect("create temp dir");
+        let config_service = hades_config::ConfigService::with_path(dir.path().join("config.toml"));
+        let mut config = hades_config::HadesConfig::default();
+        config.mcp.servers.insert(
+            "github".to_string(),
+            hades_config::McpServerConfig {
+                auto_start: false,
+                ..Default::default()
+            },
+        );
+        config_service.save(&config).expect("save config");
+
+        let storage_service = hades_storage::StorageService::with_root(dir.path().join("data"));
+        let event_bus = hades_events::EventBus::new();
+        let mut app = HadesApp::new(config_service, storage_service, event_bus);
+        app.init().expect("init app");
+        app.transition_to(AppState::Running)
+            .expect("transition to running");
+
+        let mut state = TuiState::new();
+        state.prompt_input = "/mcp test github".to_string();
+
+        let action = InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state)
+            .expect("submit MCP test command");
+
+        assert_eq!(action, KeyActionResult::TestMcpServer("github".to_string()));
+    }
+
+    #[test]
+    fn test_mcp_remove_command_routes_to_removal_action() {
+        let dir = tempdir().expect("create temp dir");
+        let config_service = hades_config::ConfigService::with_path(dir.path().join("config.toml"));
+        let mut config = hades_config::HadesConfig::default();
+        config.mcp.servers.insert(
+            "github".to_string(),
+            hades_config::McpServerConfig {
+                auto_start: false,
+                ..Default::default()
+            },
+        );
+        config_service.save(&config).expect("save config");
+
+        let storage_service = hades_storage::StorageService::with_root(dir.path().join("data"));
+        let event_bus = hades_events::EventBus::new();
+        let mut app = HadesApp::new(config_service, storage_service, event_bus);
+        app.init().expect("init app");
+        app.transition_to(AppState::Running)
+            .expect("transition to running");
+
+        let mut state = TuiState::new();
+        state.prompt_input = "/mcp remove github".to_string();
+
+        let action = InputHandler::handle_key_event(make_key(KeyCode::Enter), &mut app, &mut state)
+            .expect("submit MCP remove command");
+
+        assert_eq!(
+            action,
+            KeyActionResult::RemoveMcpServer("github".to_string())
+        );
+    }
+
+    #[test]
     fn test_ctrl_c_initiates_shutdown() {
         let (mut app, _dir) = create_test_app();
         let mut state = TuiState::new();

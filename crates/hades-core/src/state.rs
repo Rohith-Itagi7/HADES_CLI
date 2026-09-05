@@ -40,7 +40,8 @@ pub enum AppState {
 
     /// Verification failed; displaying actionable diagnostic error screen.
     VerificationFailed,
-
+    /// Interactive MCP server setup workflow.
+    McpSetup,
     /// AI generation in progress, awaiting first token chunk.
     AiThinking,
 
@@ -73,6 +74,7 @@ impl AppState {
             (AppState::Running, AppState::CommandPalette) => true,
             (AppState::Running, AppState::SessionSelect) => true,
             (AppState::Running, AppState::ProviderSelect) => true,
+            (AppState::Running, AppState::McpSetup) => true,
             (AppState::Running, AppState::AiThinking) => true,
             (AppState::Running, AppState::AiStreaming) => true,
             (AppState::Running, AppState::ToolApproval) => true,
@@ -87,7 +89,13 @@ impl AppState {
             (AppState::CommandPalette, AppState::Running) => true,
             (AppState::CommandPalette, AppState::SessionSelect) => true,
             (AppState::CommandPalette, AppState::ProviderSelect) => true,
+            (AppState::CommandPalette, AppState::McpSetup) => true,
             (AppState::CommandPalette, AppState::ShuttingDown) => true,
+
+            // From McpSetup
+            (AppState::McpSetup, AppState::Running) => true,
+            (AppState::McpSetup, AppState::CommandPalette) => true,
+            (AppState::McpSetup, AppState::ShuttingDown) => true,
 
             // From SessionSelect
             (AppState::SessionSelect, AppState::Running) => true,

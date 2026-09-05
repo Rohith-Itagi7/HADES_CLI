@@ -199,6 +199,52 @@ pub struct TuiState {
     /// Selected turn index in CopySelect mode.
     pub copy_selected_turn_index: usize,
 
+    // MCP Setup Workflow Fields
+    /// MCP server name input buffer.
+    pub mcp_server_name: String,
+
+    /// MCP server name input cursor position.
+    pub mcp_server_cursor_position: usize,
+
+    /// Selected transport type index (0 = STDIO, 1 = HTTP).
+    pub mcp_transport_selection: usize,
+
+    /// Command input for STDIO transport.
+    pub mcp_command_input: String,
+
+    /// Command input cursor position.
+    pub mcp_command_cursor_position: usize,
+
+    /// URL input for HTTP transport.
+    pub mcp_url_input: String,
+
+    /// URL input cursor position.
+    pub mcp_url_cursor_position: usize,
+
+    /// Command arguments input for STDIO.
+    pub mcp_args_input: String,
+
+    /// Args input cursor position.
+    pub mcp_args_cursor_position: usize,
+
+    /// Plaintext MCP authentication token, persisted securely outside configuration.
+    pub mcp_auth_token_input: String,
+
+    /// Cursor position in the MCP authentication token input.
+    pub mcp_auth_token_cursor_position: usize,
+
+    /// Environment variable name for token/auth fallback.
+    pub mcp_token_env_input: String,
+
+    /// Token env input cursor position.
+    pub mcp_token_env_cursor_position: usize,
+
+    /// Current field being edited in MCP setup (0=name, 1=transport, 2=command/url, 3=args, 4=token, 5=token_env).
+    pub mcp_current_field: usize,
+
+    /// Diagnostic error message for MCP setup.
+    pub mcp_setup_error: Option<String>,
+
     /// Ephemeral toast notification banner (text, creation instant).
     pub toast: Option<(String, std::time::Instant)>,
 }

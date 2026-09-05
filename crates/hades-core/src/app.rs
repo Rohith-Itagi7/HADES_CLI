@@ -262,6 +262,7 @@ impl HadesApp {
                         .set_active_session_id(&session.metadata.id)
                         .await;
                     self.active_session = Some(session);
+                    self.start_configured_mcp_servers().await;
                     return Ok(warning);
                 }
                 _ => {
@@ -282,6 +283,7 @@ impl HadesApp {
                         &new_session.metadata.title,
                     ));
                     self.active_session = Some(new_session);
+                    self.start_configured_mcp_servers().await;
 
                     return Ok(Some(format!(
                         "Hades could not find session: {session_id}. Use /sessions to view available sessions."
@@ -308,12 +310,20 @@ impl HadesApp {
         ));
         self.active_session = Some(new_session);
 
-        // Auto-start and synchronize configured MCP servers
-        self.mcp_manager.load_from_config(&self.config.mcp).await;
-        self.mcp_manager.auto_start_servers().await;
-        self.sync_mcp_tools().await;
+        self.start_configured_mcp_servers().await;
 
         Ok(None)
+    }
+
+    async fn start_configured_mcp_servers(&mut self) {
+        self.mcp_manager.load_from_config(&self.config.mcp).await;
+        for name in self.mcp_manager.auto_start_server_names().await {
+            info!(server = %name, "Auto-starting MCP server");
+            if let Err(error) = self.start_mcp_server(&name).await {
+                tracing::error!(server = %name, error = %error, "Failed to auto-start MCP server");
+            }
+        }
+        self.sync_mcp_tools().await;
     }
 
     /// Returns current application state.
@@ -379,6 +389,47 @@ impl HadesApp {
     /// Returns the credential backend reference.
     pub fn credential_backend(&self) -> &Arc<dyn CredentialBackend> {
         &self.credential_backend
+    }
+
+    fn mcp_credential_id(server_name: &str) -> String {
+        format!("mcp:{server_name}")
+    }
+
+    /// Stores an optional MCP server authentication token outside of configuration.
+    pub async fn store_mcp_auth_token(
+        &self,
+        server_name: &str,
+        token: Option<&str>,
+    ) -> Result<(), CoreError> {
+        if let Some(token) = token {
+            let credential = Credential::with_api_key(Self::mcp_credential_id(server_name), token);
+            self.credential_backend
+                .store_credential(&credential)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Retrieves an MCP server authentication token, if one is stored.
+    pub async fn mcp_auth_token(&self, server_name: &str) -> Result<Option<String>, CoreError> {
+        let credential = self
+            .credential_backend
+            .get_credential(&Self::mcp_credential_id(server_name))
+            .await?;
+        Ok(credential.and_then(|credential| {
+            credential
+                .api_key
+                .as_ref()
+                .map(|secret| secret.expose_secret().to_string())
+        }))
+    }
+
+    /// Deletes the stored authentication token for an MCP server.
+    pub async fn delete_mcp_auth_token(&self, server_name: &str) -> Result<bool, CoreError> {
+        Ok(self
+            .credential_backend
+            .delete_credential(&Self::mcp_credential_id(server_name))
+            .await?)
     }
 
     /// Returns human-readable representation of the currently active model.
@@ -477,10 +528,7 @@ impl HadesApp {
 
     /// Connects to a named MCP server and synchronizes its tools into Hades.
     pub async fn connect_mcp_server(&mut self, server_name: &str) -> Result<(), CoreError> {
-        self.mcp_manager
-            .start_server(server_name)
-            .await
-            .map_err(|e| CoreError::Runtime(e.to_string()))?;
+        self.start_mcp_server(server_name).await?;
         self.sync_mcp_tools().await;
         Ok(())
     }
@@ -500,6 +548,139 @@ impl HadesApp {
     /// Returns the pending tool approval request, if any.
     pub fn pending_approval(&self) -> Option<&PendingApproval> {
         self.pending_approval.as_ref()
+    }
+
+    /// Adds a new MCP server to the configuration and persists it.
+    pub async fn add_mcp_server(
+        &mut self,
+        name: &str,
+        transport: &str,
+        command_or_url: &str,
+        args: &str,
+        token_env: &str,
+        auth_token: Option<&str>,
+    ) -> Result<(), CoreError> {
+        use hades_config::model::{McpServerConfig, McpTransportType};
+
+        let transport_type = match transport.to_lowercase().as_str() {
+            "http" => McpTransportType::Http,
+            _ => McpTransportType::Stdio,
+        };
+
+        let mut server_config = McpServerConfig {
+            transport: transport_type,
+            enabled: true,
+            auto_start: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+
+        match server_config.transport {
+            McpTransportType::Stdio => {
+                server_config.command = Some(command_or_url.to_string());
+                if !args.is_empty() {
+                    server_config.args = args.split_whitespace().map(str::to_string).collect();
+                }
+            }
+            McpTransportType::Http | McpTransportType::Sse => {
+                server_config.url = Some(command_or_url.to_string());
+            }
+        }
+
+        if !token_env.is_empty() {
+            server_config.token_env = Some(token_env.to_string());
+        }
+
+        self.store_mcp_auth_token(name, auth_token.filter(|token| !token.trim().is_empty()))
+            .await?;
+
+        self.config
+            .mcp
+            .servers
+            .insert(name.to_string(), server_config.clone());
+        self.config_service
+            .save(&self.config)
+            .map_err(|e| CoreError::Runtime(format!("Failed to save config: {e}")))?;
+        self.event_bus
+            .publish(HadesEvent::config_saved(self.config_service.config_path()));
+
+        self.mcp_manager
+            .upsert_server_config(name, server_config)
+            .await;
+
+        if let Err(e) = self.start_mcp_server(name).await {
+            tracing::warn!("Failed to start MCP server '{}': {}", name, e);
+        } else {
+            self.sync_mcp_tools().await;
+        }
+
+        Ok(())
+    }
+
+    /// Removes an MCP server from the configuration and disconnects it.
+    pub async fn remove_mcp_server(&mut self, name: &str) -> Result<(), CoreError> {
+        if let Err(e) = self.mcp_manager.stop_server(name).await {
+            tracing::warn!("Failed to stop MCP server '{}': {}", name, e);
+        }
+
+        self.config.mcp.servers.remove(name);
+        self.config_service
+            .save(&self.config)
+            .map_err(|e| CoreError::Runtime(format!("Failed to save config: {e}")))?;
+        self.event_bus
+            .publish(HadesEvent::config_saved(self.config_service.config_path()));
+
+        self.mcp_manager.remove_server_config(name).await;
+        self.delete_mcp_auth_token(name).await?;
+
+        self.tool_registry = ToolRegistry::default_registry();
+        self.sync_mcp_tools().await;
+        Ok(())
+    }
+
+    /// Tests the connection to an MCP server and reports its status.
+    pub async fn test_mcp_server(&mut self, name: &str) -> Result<String, CoreError> {
+        if let Err(e) = self.start_mcp_server(name).await {
+            return Ok(format!(
+                "✗ Failed to connect to MCP server '{}': {}",
+                name, e
+            ));
+        }
+
+        let summaries = self.mcp_manager.list_server_summaries().await;
+        if let Some(summary) = summaries.iter().find(|s| s.name == name) {
+            let status = match &summary.state {
+                hades_mcp::McpServerState::Ready => "✓ Ready",
+                hades_mcp::McpServerState::Connected => "✓ Connected",
+                hades_mcp::McpServerState::Starting => "⟳ Starting",
+                hades_mcp::McpServerState::Configured => "○ Configured (not started)",
+                hades_mcp::McpServerState::Disconnected => "✗ Disconnected",
+                hades_mcp::McpServerState::Failed(err) => return Ok(format!("✗ Failed: {err}")),
+                hades_mcp::McpServerState::Stopping => "⟳ Stopping",
+                hades_mcp::McpServerState::Stopped => "✗ Stopped",
+            };
+
+            let mut output = format!("MCP Server Test: {name}\n\n");
+            output.push_str(&format!("Status:    {status}\n"));
+            output.push_str(&format!("Transport: {}\n", summary.transport));
+            output.push_str(&format!("Tools:     {}\n", summary.tool_count));
+            output.push_str(&format!("Resources: {}\n", summary.resource_count));
+            if let Some(error) = &summary.error {
+                output.push_str(&format!("Error:     {error}\n"));
+            }
+            Ok(output)
+        } else {
+            Ok(format!("✗ MCP server '{name}' not found in summaries"))
+        }
+    }
+
+    async fn start_mcp_server(&self, name: &str) -> Result<(), CoreError> {
+        let auth_token = self.mcp_auth_token(name).await?;
+        self.mcp_manager
+            .start_server(name, auth_token.as_deref())
+            .await
+            .map(|_| ())
+            .map_err(|error| CoreError::Runtime(error.to_string()))
     }
 
     /// Sets or clears the pending tool approval request.
@@ -1638,6 +1819,7 @@ impl HadesApp {
                 let transport_str = match cfg.transport {
                     hades_config::McpTransportType::Stdio => "stdio".to_string(),
                     hades_config::McpTransportType::Http => "http".to_string(),
+                    hades_config::McpTransportType::Sse => "sse".to_string(),
                 };
                 let tool_count = self
                     .tool_registry
@@ -1708,6 +1890,13 @@ impl HadesApp {
                     || matches!(output, CommandOutput::OpenSessionPicker)
                 {
                     self.transition_to(AppState::SessionSelect)?;
+                } else if matches!(output, CommandOutput::OpenMcpSetup) {
+                    self.transition_to(AppState::McpSetup)?;
+                } else if matches!(
+                    output,
+                    CommandOutput::RemoveMcpServer(_) | CommandOutput::TestMcpServer(_)
+                ) {
+                    // Will be handled asynchronously in the runner
                 } else if context.shutdown_requested || matches!(output, CommandOutput::Exit) {
                     self.request_shutdown(Some("Command exit requested".to_string()))?;
                 } else if let CommandOutput::ImportSuccess(ref record) = output {

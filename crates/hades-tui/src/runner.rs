@@ -12,7 +12,7 @@ use crate::input::{InputHandler, KeyActionResult};
 use crate::state::TuiState;
 use crate::terminal::{init_terminal, restore_terminal};
 use crate::ui;
-use hades_core::{AppState, HadesApp};
+use hades_core::{AppState, CommandOutput, HadesApp};
 use hades_provider::{Credential, Model, StreamEvent};
 
 /// Runs the full-screen Ratatui UI event loop with application-owned scrollable conversation viewport.
@@ -361,6 +361,38 @@ impl TuiRunner {
                                             tui_state.set_error(e.to_string());
                                             let _ = app.transition_to(AppState::Running);
                                         }
+                                    }
+                                }
+                                KeyActionResult::AddMcpServer {
+                                    name,
+                                    transport,
+                                    command_or_url,
+                                    args,
+                                    auth_token,
+                                    token_env,
+                                } => {
+                                    // Add MCP server configuration and persist it
+                                    app.transition_to(AppState::Running)?;
+                                    let auth_token = (!auth_token.is_empty()).then_some(auth_token.as_str());
+                                    match app.add_mcp_server(&name, &transport, &command_or_url, &args, &token_env, auth_token).await {
+                                        Ok(_) => {
+                                            tui_state.show_toast(format!("✓ MCP server '{}' added successfully", name));
+                                        }
+                                        Err(e) => {
+                                            tui_state.set_error(format!("Failed to add MCP server '{}': {}", name, e));
+                                        }
+                                    }
+                                }
+                                KeyActionResult::RemoveMcpServer(name) => {
+                                    match app.remove_mcp_server(&name).await {
+                                        Ok(()) => tui_state.show_toast(format!("MCP server '{}' removed", name)),
+                                        Err(e) => tui_state.set_error(e.to_string()),
+                                    }
+                                }
+                                KeyActionResult::TestMcpServer(name) => {
+                                    match app.test_mcp_server(&name).await {
+                                        Ok(result) => tui_state.set_output(CommandOutput::Text(result)),
+                                        Err(e) => tui_state.set_error(e.to_string()),
                                     }
                                 }
                                 KeyActionResult::SubmitPrompt(prompt) => {
