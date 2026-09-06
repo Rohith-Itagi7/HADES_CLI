@@ -17,7 +17,7 @@ pub use protocol::{
 };
 pub use server::HadesMcpServer;
 pub use tool_adapter::McpToolAdapter;
-pub use transport::{HttpTransport, McpTransport, StdioTransport};
+pub use transport::{HttpTransport, McpTransport, SseTransport, StdioTransport};
 
 #[cfg(test)]
 mod tests {
@@ -128,6 +128,43 @@ mod tests {
 
         let ping_dur = client.ping().await.expect("ping succeeds");
         assert!(ping_dur.as_millis() < 500);
+    }
+
+    #[tokio::test]
+    async fn test_upserted_server_config_is_immediately_startable() {
+        let manager = McpServerManager::new(".");
+        manager
+            .upsert_server_config("new-server", hades_config::McpServerConfig::default())
+            .await;
+
+        let summaries = manager.list_server_summaries().await;
+        assert!(summaries.iter().any(|summary| summary.name == "new-server"));
+
+        let error = match manager.start_server("new-server", None).await {
+            Ok(_) => panic!("configured server without a command should fail startup validation"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("missing 'command'"));
+    }
+
+    #[tokio::test]
+    async fn test_removed_server_config_is_no_longer_startable() {
+        let manager = McpServerManager::new(".");
+        manager
+            .upsert_server_config("removed-server", hades_config::McpServerConfig::default())
+            .await;
+
+        assert!(manager
+            .remove_server_config("removed-server")
+            .await
+            .is_some());
+        assert!(manager.list_server_summaries().await.is_empty());
+
+        let error = match manager.start_server("removed-server", None).await {
+            Ok(_) => panic!("removed server should not be startable"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("is not configured"));
     }
 
     #[tokio::test]

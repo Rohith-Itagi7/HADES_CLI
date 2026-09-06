@@ -3,18 +3,25 @@ pub mod command;
 pub mod context;
 pub mod error;
 pub mod notification;
+pub mod orchestration;
 pub mod state;
 
 pub use app::{HadesApp, APP_VERSION};
 pub use command::{
-    Command, CommandContext, CommandInfo, CommandOutput, CommandRegistry, ExitCommand,
-    ExportCommand, HelpCommand, HelpEntry, ImportCommand, ModelCommand, NewSessionCommand,
-    NotifyCommand, SessionsCommand, StatusCommand, StatusInfo, SwitchCommand,
+    Command, CommandContext, CommandInfo, CommandOutput, CommandRegistry, DebugCommand,
+    ExitCommand, ExportCommand, HelpCommand, HelpEntry, ImportCommand, ModelCommand,
+    NewSessionCommand, NotifyCommand, PaletteItem, SessionsCommand, StatusCommand, StatusInfo,
+    SubcommandInfo, SwitchCommand,
 };
 
 pub use context::{ContextManager, ContextReport, TokenEstimator, UsageKind};
 pub use error::{CommandError, CoreError};
 pub use notification::{NotificationKind, NotificationService, SoundPlayer};
+pub use orchestration::{
+    CapabilityIndex, OrchestrationResult, ProviderTokenProfile, RequestPlan, SmartContextBuilder,
+    SmartContextOrchestrator, TaskDomain, TaskIntent, TaskIntentAnalyzer, TokenBudgetManager,
+    ToolMetadata, ToolRelevanceEngine, ToolSelectionResult, ToolSource,
+};
 pub use state::AppState;
 
 #[cfg(test)]
@@ -282,6 +289,129 @@ mod tests {
         let output_mcp = app.execute_command("/mcp").expect("execute /mcp");
         assert!(
             matches!(output_mcp, CommandOutput::Text(t) if t.contains("MODEL CONTEXT PROTOCOL"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_auth_token_storage_lifecycle() {
+        let (app, _dir) = create_test_app();
+
+        assert_eq!(
+            app.mcp_auth_token("github")
+                .await
+                .expect("read missing MCP token"),
+            None
+        );
+
+        app.store_mcp_auth_token("github", Some("test-mcp-token"))
+            .await
+            .expect("store MCP token");
+        assert_eq!(
+            app.mcp_auth_token("github").await.expect("read MCP token"),
+            Some("test-mcp-token".to_string())
+        );
+
+        let stored = app
+            .credential_backend()
+            .get_credential("mcp:github")
+            .await
+            .expect("read namespaced credential")
+            .expect("stored MCP credential");
+        assert_eq!(stored.provider_id, "mcp:github");
+
+        assert!(app
+            .delete_mcp_auth_token("github")
+            .await
+            .expect("delete MCP token"));
+        assert_eq!(
+            app.mcp_auth_token("github")
+                .await
+                .expect("read deleted MCP token"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mcp_add_and_remove_keep_manager_configuration_synchronized() {
+        let (mut app, dir) = create_test_app();
+        app.init().expect("app init");
+        app.transition_to(AppState::Running)
+            .expect("transition to running");
+
+        app.add_mcp_server(
+            "test-server",
+            "stdio",
+            "__hades_missing_mcp_test_server__",
+            "",
+            "",
+            Some("test-mcp-token"),
+        )
+        .await
+        .expect("add MCP server");
+
+        assert!(app.config().mcp.servers.contains_key("test-server"));
+        assert!(app.config().mcp.servers["test-server"].auto_start);
+        assert_eq!(
+            app.mcp_auth_token("test-server")
+                .await
+                .expect("read stored MCP token"),
+            Some("test-mcp-token".to_string())
+        );
+        let config_contents =
+            std::fs::read_to_string(dir.path().join("config.toml")).expect("read MCP config");
+        assert!(!config_contents.contains("test-mcp-token"));
+        assert!(app
+            .mcp_manager()
+            .list_server_summaries()
+            .await
+            .iter()
+            .any(|summary| summary.name == "test-server"));
+
+        app.remove_mcp_server("test-server")
+            .await
+            .expect("remove MCP server");
+
+        assert!(!app.config().mcp.servers.contains_key("test-server"));
+        assert_eq!(
+            app.mcp_auth_token("test-server")
+                .await
+                .expect("read deleted MCP token"),
+            None
+        );
+        assert!(app.mcp_manager().list_server_summaries().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_mcp_add_without_token_does_not_create_credential() {
+        let (mut app, _dir) = create_test_app();
+        app.init().expect("app init");
+        app.transition_to(AppState::Running)
+            .expect("transition to running");
+
+        app.add_mcp_server(
+            "env-only-server",
+            "stdio",
+            "__hades_missing_mcp_test_server__",
+            "",
+            "HADES_TEST_MCP_TOKEN",
+            None,
+        )
+        .await
+        .expect("add MCP server without token");
+
+        assert_eq!(
+            app.mcp_auth_token("env-only-server")
+                .await
+                .expect("read missing MCP token"),
+            None
+        );
+        assert_eq!(
+            app.config()
+                .mcp
+                .servers
+                .get("env-only-server")
+                .and_then(|server| server.token_env.as_deref()),
+            Some("HADES_TEST_MCP_TOKEN")
         );
     }
 

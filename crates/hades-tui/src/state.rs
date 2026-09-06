@@ -99,6 +99,12 @@ pub struct TuiState {
     /// Currently highlighted index within the command palette.
     pub selected_palette_index: usize,
 
+    /// Optional parent command if currently in a second-level subcommand selection menu.
+    pub active_subcommand_parent: Option<String>,
+
+    /// Vertical scroll offset in the command palette when items overflow visible area.
+    pub palette_scroll_offset: usize,
+
     /// User prompt input buffer for chat in Running state.
     pub prompt_input: String,
 
@@ -199,6 +205,52 @@ pub struct TuiState {
     /// Selected turn index in CopySelect mode.
     pub copy_selected_turn_index: usize,
 
+    // MCP Setup Workflow Fields
+    /// MCP server name input buffer.
+    pub mcp_server_name: String,
+
+    /// MCP server name input cursor position.
+    pub mcp_server_cursor_position: usize,
+
+    /// Selected transport type index (0 = STDIO, 1 = HTTP).
+    pub mcp_transport_selection: usize,
+
+    /// Command input for STDIO transport.
+    pub mcp_command_input: String,
+
+    /// Command input cursor position.
+    pub mcp_command_cursor_position: usize,
+
+    /// URL input for HTTP transport.
+    pub mcp_url_input: String,
+
+    /// URL input cursor position.
+    pub mcp_url_cursor_position: usize,
+
+    /// Command arguments input for STDIO.
+    pub mcp_args_input: String,
+
+    /// Args input cursor position.
+    pub mcp_args_cursor_position: usize,
+
+    /// Plaintext MCP authentication token, persisted securely outside configuration.
+    pub mcp_auth_token_input: String,
+
+    /// Cursor position in the MCP authentication token input.
+    pub mcp_auth_token_cursor_position: usize,
+
+    /// Environment variable name for token/auth fallback.
+    pub mcp_token_env_input: String,
+
+    /// Token env input cursor position.
+    pub mcp_token_env_cursor_position: usize,
+
+    /// Current field being edited in MCP setup (0=name, 1=transport, 2=command/url, 3=args, 4=token, 5=token_env).
+    pub mcp_current_field: usize,
+
+    /// Diagnostic error message for MCP setup.
+    pub mcp_setup_error: Option<String>,
+
     /// Ephemeral toast notification banner (text, creation instant).
     pub toast: Option<(String, std::time::Instant)>,
 }
@@ -290,6 +342,30 @@ impl TuiState {
         if self.prompt_cursor_position > 0 {
             self.prompt_cursor_position -= 1;
             self.prompt_input.remove(self.prompt_cursor_position);
+        }
+    }
+
+    /// Removes a character following the cursor in the user chat prompt.
+    pub fn delete_prompt_char(&mut self) {
+        if self.prompt_cursor_position < self.prompt_input.len() {
+            self.prompt_input.remove(self.prompt_cursor_position);
+        }
+    }
+
+    /// Adjusts command palette scroll offset so the selected item remains visible.
+    pub fn adjust_palette_scroll(&mut self, total_items: usize, visible_capacity: usize) {
+        if total_items <= visible_capacity || visible_capacity == 0 {
+            self.palette_scroll_offset = 0;
+            return;
+        }
+        if self.selected_palette_index < self.palette_scroll_offset {
+            self.palette_scroll_offset = self.selected_palette_index;
+        } else if self.selected_palette_index >= self.palette_scroll_offset + visible_capacity {
+            self.palette_scroll_offset = self.selected_palette_index + 1 - visible_capacity;
+        }
+        let max_offset = total_items.saturating_sub(visible_capacity);
+        if self.palette_scroll_offset > max_offset {
+            self.palette_scroll_offset = max_offset;
         }
     }
 

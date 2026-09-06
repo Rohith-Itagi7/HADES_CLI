@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::state::{ChatTurn, TuiState};
 use hades_core::{AppState, CommandOutput, CoreError, HadesApp};
@@ -39,6 +39,22 @@ pub enum KeyActionResult {
 
     /// User resolved a tool approval request.
     ResolveToolApproval(hades_tools::ApprovalDecision),
+
+    /// User confirmed adding a new MCP server with configuration.
+    AddMcpServer {
+        name: String,
+        transport: String,
+        command_or_url: String,
+        args: String,
+        auth_token: String,
+        token_env: String,
+    },
+
+    /// User requested removing an MCP server.
+    RemoveMcpServer(String),
+
+    /// User requested testing an MCP server.
+    TestMcpServer(String),
 
     /// Application should initiate graceful shutdown and terminate.
     Quit,
@@ -80,6 +96,7 @@ impl InputHandler {
             }
             AppState::ToolApproval => Self::handle_tool_approval(key_event, app, tui_state),
             AppState::CopySelect => Self::handle_copy_select(key_event, app, tui_state),
+            AppState::McpSetup => Self::handle_mcp_setup(key_event, app, tui_state),
             _ => Ok(KeyActionResult::Handled),
         }
     }
@@ -117,7 +134,10 @@ impl InputHandler {
         match key_event.code {
             // Open command palette on '/' when prompt input is empty
             KeyCode::Char('/') if tui_state.prompt_input.is_empty() => {
+                tui_state.push_prompt_char('/');
                 tui_state.selected_palette_index = 0;
+                tui_state.active_subcommand_parent = None;
+                tui_state.palette_scroll_offset = 0;
                 tui_state.clear_error();
                 app.transition_to(AppState::CommandPalette)?;
                 Ok(KeyActionResult::Handled)
@@ -150,6 +170,13 @@ impl InputHandler {
                             CommandOutput::NewSession => Ok(KeyActionResult::NewSession),
                             CommandOutput::OpenSessionPicker => {
                                 Ok(KeyActionResult::OpenSessionPicker)
+                            }
+                            CommandOutput::OpenMcpSetup => Ok(KeyActionResult::Handled),
+                            CommandOutput::RemoveMcpServer(name) => {
+                                Ok(KeyActionResult::RemoveMcpServer(name))
+                            }
+                            CommandOutput::TestMcpServer(name) => {
+                                Ok(KeyActionResult::TestMcpServer(name))
                             }
                             CommandOutput::ExportSuccess(path) => {
                                 tui_state.show_toast(format!(
@@ -341,10 +368,69 @@ impl InputHandler {
         app: &mut HadesApp,
         tui_state: &mut TuiState,
     ) -> Result<KeyActionResult, CoreError> {
-        let commands = app.commands().list();
-        let count = commands.len();
+        let items = app.commands().filter_palette(
+            &tui_state.prompt_input,
+            tui_state.active_subcommand_parent.as_deref(),
+        );
+        let count = items.len();
 
         match key_event.code {
+            KeyCode::Char(c) => {
+                // If currently in a subcommand menu, smoothly exit menu into continuous query
+                if tui_state.active_subcommand_parent.is_some() {
+                    if !tui_state.prompt_input.ends_with(' ') && c != ' ' {
+                        tui_state.push_prompt_char(' ');
+                    }
+                    tui_state.active_subcommand_parent = None;
+                }
+                tui_state.push_prompt_char(c);
+                tui_state.selected_palette_index = 0;
+                tui_state.palette_scroll_offset = 0;
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Backspace => {
+                if tui_state.active_subcommand_parent.is_some() {
+                    // Backspace in subcommand menu returns to top-level command palette
+                    tui_state.active_subcommand_parent = None;
+                    tui_state.selected_palette_index = 0;
+                    tui_state.palette_scroll_offset = 0;
+                } else {
+                    tui_state.pop_prompt_char();
+                    tui_state.selected_palette_index = 0;
+                    tui_state.palette_scroll_offset = 0;
+                    // If prompt input became empty (deleted '/'), return cleanly to Running state
+                    if tui_state.prompt_input.is_empty() {
+                        app.transition_to(AppState::Running)?;
+                    }
+                }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Delete => {
+                tui_state.delete_prompt_char();
+                tui_state.selected_palette_index = 0;
+                tui_state.palette_scroll_offset = 0;
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Left => {
+                if tui_state.prompt_cursor_position > 0 {
+                    tui_state.prompt_cursor_position -= 1;
+                }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Right => {
+                if tui_state.prompt_cursor_position < tui_state.prompt_input.len() {
+                    tui_state.prompt_cursor_position += 1;
+                }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Home => {
+                tui_state.prompt_cursor_position = 0;
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::End => {
+                tui_state.prompt_cursor_position = tui_state.prompt_input.len();
+                Ok(KeyActionResult::Handled)
+            }
             KeyCode::Up => {
                 if count > 0 {
                     tui_state.selected_palette_index = if tui_state.selected_palette_index == 0 {
@@ -352,6 +438,7 @@ impl InputHandler {
                     } else {
                         tui_state.selected_palette_index - 1
                     };
+                    tui_state.adjust_palette_scroll(count, 8);
                 }
                 Ok(KeyActionResult::Handled)
             }
@@ -359,76 +446,140 @@ impl InputHandler {
                 if count > 0 {
                     tui_state.selected_palette_index =
                         (tui_state.selected_palette_index + 1) % count;
+                    tui_state.adjust_palette_scroll(count, 8);
                 }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Tab => {
+                if let Some(item) = items.get(tui_state.selected_palette_index) {
+                    let mut completion = item.execution_text.clone();
+                    if item.has_subcommands && !completion.ends_with(' ') {
+                        completion.push(' ');
+                    }
+                    tui_state.prompt_input = completion;
+                    tui_state.prompt_cursor_position = tui_state.prompt_input.len();
+                    tui_state.active_subcommand_parent = None;
+                    tui_state.selected_palette_index = 0;
+                    tui_state.palette_scroll_offset = 0;
+                }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Esc => {
+                tui_state.active_subcommand_parent = None;
+                tui_state.selected_palette_index = 0;
+                tui_state.palette_scroll_offset = 0;
+                app.transition_to(AppState::Running)?;
                 Ok(KeyActionResult::Handled)
             }
             KeyCode::Enter => {
-                if let Some(cmd_info) = commands.get(tui_state.selected_palette_index) {
-                    let cmd_name = cmd_info.name.clone();
-                    debug!(command = %cmd_name, "Executing selected command from palette");
-
-                    app.transition_to(AppState::Running)?;
-                    match app.execute_command(&cmd_name) {
-                        Ok(output) => match output {
-                            CommandOutput::OpenModelSetup => {
-                                tui_state.is_model_switch_flow = false;
-                                tui_state.providers = app.model_manager().list_providers();
-                                tui_state.selected_provider_index = 0;
-                                Ok(KeyActionResult::Handled)
-                            }
-                            CommandOutput::OpenModelSwitch => {
-                                tui_state.is_model_switch_flow = true;
-                                tui_state.providers = app.model_manager().list_providers();
-                                tui_state.selected_provider_index = 0;
-                                Ok(KeyActionResult::Handled)
-                            }
-                            CommandOutput::NewSession => Ok(KeyActionResult::NewSession),
-                            CommandOutput::OpenSessionPicker => {
-                                Ok(KeyActionResult::OpenSessionPicker)
-                            }
-                            CommandOutput::ExportSuccess(path) => {
-                                tui_state.show_toast(format!(
-                                    "Successfully exported to {}",
-                                    path.display()
-                                ));
-                                tui_state.set_output(CommandOutput::Text(format!(
-                                    "✓ Successfully exported session to {}",
-                                    path.display()
-                                )));
-                                Ok(KeyActionResult::Handled)
-                            }
-                            CommandOutput::ImportSuccess(record) => {
-                                tui_state.reconstruct_turns_from_session(&record);
-                                tui_state.show_toast(format!(
-                                    "Successfully imported: {}",
-                                    record.metadata.title
-                                ));
-                                tui_state.set_output(CommandOutput::Text(format!(
-                                    "✓ Successfully imported session '{}' ({} messages)",
-                                    record.metadata.title,
-                                    record.messages.len()
-                                )));
-                                tui_state.scroll_to_bottom();
-                                Ok(KeyActionResult::Handled)
-                            }
-                            CommandOutput::Exit => Ok(KeyActionResult::Quit),
-                            _ => {
-                                tui_state.set_output(output);
-                                Ok(KeyActionResult::Handled)
-                            }
-                        },
-                        Err(e) => {
-                            tui_state.set_error(e.to_string());
-                            Ok(KeyActionResult::Handled)
+                // Check if user selected a command with subcommands in top-level mode
+                if tui_state.active_subcommand_parent.is_none() {
+                    if let Some(selected) = items.get(tui_state.selected_palette_index) {
+                        let typed_trimmed = tui_state.prompt_input.trim();
+                        if selected.has_subcommands
+                            && (typed_trimmed == selected.execution_text
+                                || typed_trimmed == "/"
+                                || typed_trimmed == selected.display_name)
+                        {
+                            tui_state.active_subcommand_parent =
+                                Some(selected.execution_text.clone());
+                            tui_state.selected_palette_index = 0;
+                            tui_state.palette_scroll_offset = 0;
+                            return Ok(KeyActionResult::Handled);
                         }
                     }
-                } else {
-                    Ok(KeyActionResult::Handled)
                 }
-            }
-            KeyCode::Esc => {
+
+                // Check if user selected a subcommand that requires additional arguments
+                if tui_state.active_subcommand_parent.is_some() {
+                    if let Some(selected) = items.get(tui_state.selected_palette_index) {
+                        if selected.requires_args {
+                            tui_state.prompt_input = selected.execution_text.clone();
+                            tui_state.prompt_cursor_position = tui_state.prompt_input.len();
+                            tui_state.active_subcommand_parent = None;
+                            tui_state.selected_palette_index = 0;
+                            tui_state.palette_scroll_offset = 0;
+                            return Ok(KeyActionResult::Handled);
+                        }
+                    }
+                }
+
+                // Determine final command string to execute
+                let typed = tui_state.prompt_input.trim().to_string();
+                let command_to_run = if typed.contains(' ') {
+                    typed
+                } else if let Some(selected) = items.get(tui_state.selected_palette_index) {
+                    selected.execution_text.clone()
+                } else if !typed.is_empty() {
+                    typed
+                } else {
+                    return Ok(KeyActionResult::Handled);
+                };
+
+                tui_state.prompt_input.clear();
+                tui_state.prompt_cursor_position = 0;
+                tui_state.active_subcommand_parent = None;
+                tui_state.selected_palette_index = 0;
+                tui_state.palette_scroll_offset = 0;
+
                 app.transition_to(AppState::Running)?;
-                Ok(KeyActionResult::Handled)
+                match app.execute_command(&command_to_run) {
+                    Ok(output) => match output {
+                        CommandOutput::OpenModelSetup => {
+                            tui_state.is_model_switch_flow = false;
+                            tui_state.providers = app.model_manager().list_providers();
+                            tui_state.selected_provider_index = 0;
+                            Ok(KeyActionResult::Handled)
+                        }
+                        CommandOutput::OpenModelSwitch => {
+                            tui_state.is_model_switch_flow = true;
+                            tui_state.providers = app.model_manager().list_providers();
+                            tui_state.selected_provider_index = 0;
+                            Ok(KeyActionResult::Handled)
+                        }
+                        CommandOutput::NewSession => Ok(KeyActionResult::NewSession),
+                        CommandOutput::OpenSessionPicker => Ok(KeyActionResult::OpenSessionPicker),
+                        CommandOutput::OpenMcpSetup => Ok(KeyActionResult::Handled),
+                        CommandOutput::ExportSuccess(path) => {
+                            tui_state
+                                .show_toast(format!("Successfully exported to {}", path.display()));
+                            tui_state.set_output(CommandOutput::Text(format!(
+                                "✓ Successfully exported session to {}",
+                                path.display()
+                            )));
+                            Ok(KeyActionResult::Handled)
+                        }
+                        CommandOutput::ImportSuccess(record) => {
+                            tui_state.reconstruct_turns_from_session(&record);
+                            tui_state.show_toast(format!(
+                                "Successfully imported: {}",
+                                record.metadata.title
+                            ));
+                            tui_state.set_output(CommandOutput::Text(format!(
+                                "✓ Successfully imported session '{}' ({} messages)",
+                                record.metadata.title,
+                                record.messages.len()
+                            )));
+                            tui_state.scroll_to_bottom();
+                            Ok(KeyActionResult::Handled)
+                        }
+                        CommandOutput::Exit => Ok(KeyActionResult::Quit),
+                        CommandOutput::RemoveMcpServer(name) => {
+                            Ok(KeyActionResult::RemoveMcpServer(name))
+                        }
+                        CommandOutput::TestMcpServer(name) => {
+                            Ok(KeyActionResult::TestMcpServer(name))
+                        }
+                        _ => {
+                            tui_state.set_output(output);
+                            Ok(KeyActionResult::Handled)
+                        }
+                    },
+                    Err(e) => {
+                        tui_state.set_error(e.to_string());
+                        Ok(KeyActionResult::Handled)
+                    }
+                }
             }
             _ => Ok(KeyActionResult::Handled),
         }
@@ -821,6 +972,287 @@ impl InputHandler {
                     _ => hades_tools::ApprovalDecision::Cancel,
                 };
                 Ok(KeyActionResult::ResolveToolApproval(decision))
+            }
+            _ => Ok(KeyActionResult::Handled),
+        }
+    }
+
+    fn handle_mcp_setup(
+        key_event: KeyEvent,
+        app: &mut HadesApp,
+        tui_state: &mut TuiState,
+    ) -> Result<KeyActionResult, CoreError> {
+        match key_event.code {
+            KeyCode::Tab | KeyCode::Down => {
+                tui_state.mcp_current_field = (tui_state.mcp_current_field + 1) % 6;
+                tui_state.mcp_setup_error = None;
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                tui_state.mcp_current_field = if tui_state.mcp_current_field == 0 {
+                    5
+                } else {
+                    tui_state.mcp_current_field - 1
+                };
+                tui_state.mcp_setup_error = None;
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Char(c) => {
+                match tui_state.mcp_current_field {
+                    0 => {
+                        // Server name field
+                        tui_state
+                            .mcp_server_name
+                            .insert(tui_state.mcp_server_cursor_position, c);
+                        tui_state.mcp_server_cursor_position += 1;
+                    }
+                    1 => {
+                        // Transport selection: Left/Right to change, this is numbers only
+                    }
+                    2 => {
+                        // Command/URL field based on transport
+                        let max_len = 256;
+                        if tui_state.mcp_transport_selection == 0 {
+                            if tui_state.mcp_command_input.len() < max_len {
+                                tui_state
+                                    .mcp_command_input
+                                    .insert(tui_state.mcp_command_cursor_position, c);
+                                tui_state.mcp_command_cursor_position += 1;
+                            }
+                        } else {
+                            if tui_state.mcp_url_input.len() < max_len {
+                                tui_state
+                                    .mcp_url_input
+                                    .insert(tui_state.mcp_url_cursor_position, c);
+                                tui_state.mcp_url_cursor_position += 1;
+                            }
+                        }
+                    }
+                    3 => {
+                        // Args field
+                        tui_state
+                            .mcp_args_input
+                            .insert(tui_state.mcp_args_cursor_position, c);
+                        tui_state.mcp_args_cursor_position += 1;
+                    }
+                    4 => {
+                        tui_state
+                            .mcp_auth_token_input
+                            .insert(tui_state.mcp_auth_token_cursor_position, c);
+                        tui_state.mcp_auth_token_cursor_position += 1;
+                    }
+                    5 => {
+                        // Token env field
+                        tui_state
+                            .mcp_token_env_input
+                            .insert(tui_state.mcp_token_env_cursor_position, c);
+                        tui_state.mcp_token_env_cursor_position += 1;
+                    }
+                    _ => {}
+                }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Backspace => {
+                match tui_state.mcp_current_field {
+                    0 => {
+                        if tui_state.mcp_server_cursor_position > 0 {
+                            tui_state.mcp_server_cursor_position -= 1;
+                            tui_state
+                                .mcp_server_name
+                                .remove(tui_state.mcp_server_cursor_position);
+                        }
+                    }
+                    2 => {
+                        if tui_state.mcp_transport_selection == 0 {
+                            if tui_state.mcp_command_cursor_position > 0 {
+                                tui_state.mcp_command_cursor_position -= 1;
+                                tui_state
+                                    .mcp_command_input
+                                    .remove(tui_state.mcp_command_cursor_position);
+                            }
+                        } else {
+                            if tui_state.mcp_url_cursor_position > 0 {
+                                tui_state.mcp_url_cursor_position -= 1;
+                                tui_state
+                                    .mcp_url_input
+                                    .remove(tui_state.mcp_url_cursor_position);
+                            }
+                        }
+                    }
+                    3 => {
+                        if tui_state.mcp_args_cursor_position > 0 {
+                            tui_state.mcp_args_cursor_position -= 1;
+                            tui_state
+                                .mcp_args_input
+                                .remove(tui_state.mcp_args_cursor_position);
+                        }
+                    }
+                    4 if tui_state.mcp_auth_token_cursor_position > 0 => {
+                        tui_state.mcp_auth_token_cursor_position -= 1;
+                        tui_state
+                            .mcp_auth_token_input
+                            .remove(tui_state.mcp_auth_token_cursor_position);
+                    }
+                    5 if tui_state.mcp_token_env_cursor_position > 0 => {
+                        tui_state.mcp_token_env_cursor_position -= 1;
+                        tui_state
+                            .mcp_token_env_input
+                            .remove(tui_state.mcp_token_env_cursor_position);
+                    }
+                    _ => {}
+                }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Left => {
+                match tui_state.mcp_current_field {
+                    0 => {
+                        if tui_state.mcp_server_cursor_position > 0 {
+                            tui_state.mcp_server_cursor_position -= 1;
+                        }
+                    }
+                    1 => {
+                        tui_state.mcp_transport_selection = 0; // STDIO
+                    }
+                    2 => {
+                        if tui_state.mcp_transport_selection == 0
+                            && tui_state.mcp_command_cursor_position > 0
+                        {
+                            tui_state.mcp_command_cursor_position -= 1;
+                        } else if tui_state.mcp_transport_selection == 1
+                            && tui_state.mcp_url_cursor_position > 0
+                        {
+                            tui_state.mcp_url_cursor_position -= 1;
+                        }
+                    }
+                    3 => {
+                        if tui_state.mcp_args_cursor_position > 0 {
+                            tui_state.mcp_args_cursor_position -= 1;
+                        }
+                    }
+                    4 if tui_state.mcp_auth_token_cursor_position > 0 => {
+                        tui_state.mcp_auth_token_cursor_position -= 1;
+                    }
+                    5 if tui_state.mcp_token_env_cursor_position > 0 => {
+                        tui_state.mcp_token_env_cursor_position -= 1;
+                    }
+                    _ => {}
+                }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Right => {
+                match tui_state.mcp_current_field {
+                    0 => {
+                        if tui_state.mcp_server_cursor_position < tui_state.mcp_server_name.len() {
+                            tui_state.mcp_server_cursor_position += 1;
+                        }
+                    }
+                    1 => {
+                        tui_state.mcp_transport_selection = 1; // HTTP
+                    }
+                    2 => {
+                        if tui_state.mcp_transport_selection == 0
+                            && tui_state.mcp_command_cursor_position
+                                < tui_state.mcp_command_input.len()
+                        {
+                            tui_state.mcp_command_cursor_position += 1;
+                        } else if tui_state.mcp_transport_selection == 1
+                            && tui_state.mcp_url_cursor_position < tui_state.mcp_url_input.len()
+                        {
+                            tui_state.mcp_url_cursor_position += 1;
+                        }
+                    }
+                    3 => {
+                        if tui_state.mcp_args_cursor_position < tui_state.mcp_args_input.len() {
+                            tui_state.mcp_args_cursor_position += 1;
+                        }
+                    }
+                    4 if tui_state.mcp_auth_token_cursor_position
+                        < tui_state.mcp_auth_token_input.len() =>
+                    {
+                        tui_state.mcp_auth_token_cursor_position += 1;
+                    }
+                    5 if tui_state.mcp_token_env_cursor_position
+                        < tui_state.mcp_token_env_input.len() =>
+                    {
+                        tui_state.mcp_token_env_cursor_position += 1;
+                    }
+                    _ => {}
+                }
+                Ok(KeyActionResult::Handled)
+            }
+            KeyCode::Enter => {
+                // Validate inputs
+                if tui_state.mcp_server_name.trim().is_empty() {
+                    tui_state.mcp_setup_error = Some("Server name cannot be empty".to_string());
+                    return Ok(KeyActionResult::Handled);
+                }
+
+                if tui_state.mcp_transport_selection == 0
+                    && tui_state.mcp_command_input.trim().is_empty()
+                {
+                    tui_state.mcp_setup_error =
+                        Some("Command cannot be empty for STDIO transport".to_string());
+                    return Ok(KeyActionResult::Handled);
+                }
+
+                if tui_state.mcp_transport_selection == 1
+                    && tui_state.mcp_url_input.trim().is_empty()
+                {
+                    tui_state.mcp_setup_error =
+                        Some("URL cannot be empty for HTTP transport".to_string());
+                    return Ok(KeyActionResult::Handled);
+                }
+
+                // Create result with captured values
+                let transport = if tui_state.mcp_transport_selection == 0 {
+                    "stdio".to_string()
+                } else {
+                    "http".to_string()
+                };
+
+                let command_or_url = if tui_state.mcp_transport_selection == 0 {
+                    tui_state.mcp_command_input.trim().to_string()
+                } else {
+                    tui_state.mcp_url_input.trim().to_string()
+                };
+
+                let result = KeyActionResult::AddMcpServer {
+                    name: tui_state.mcp_server_name.trim().to_string(),
+                    transport,
+                    command_or_url,
+                    args: tui_state.mcp_args_input.trim().to_string(),
+                    auth_token: tui_state.mcp_auth_token_input.trim().to_string(),
+                    token_env: tui_state.mcp_token_env_input.trim().to_string(),
+                };
+
+                // Reset fields
+                tui_state.mcp_server_name.clear();
+                tui_state.mcp_command_input.clear();
+                tui_state.mcp_url_input.clear();
+                tui_state.mcp_args_input.clear();
+                tui_state.mcp_auth_token_input.clear();
+                tui_state.mcp_token_env_input.clear();
+                tui_state.mcp_current_field = 0;
+                tui_state.mcp_transport_selection = 0;
+                tui_state.mcp_setup_error = None;
+
+                app.transition_to(AppState::Running)?;
+                Ok(result)
+            }
+            KeyCode::Esc => {
+                // Reset fields
+                tui_state.mcp_server_name.clear();
+                tui_state.mcp_command_input.clear();
+                tui_state.mcp_url_input.clear();
+                tui_state.mcp_args_input.clear();
+                tui_state.mcp_auth_token_input.clear();
+                tui_state.mcp_token_env_input.clear();
+                tui_state.mcp_current_field = 0;
+                tui_state.mcp_transport_selection = 0;
+                tui_state.mcp_setup_error = None;
+
+                app.transition_to(AppState::Running)?;
+                Ok(KeyActionResult::Handled)
             }
             _ => Ok(KeyActionResult::Handled),
         }

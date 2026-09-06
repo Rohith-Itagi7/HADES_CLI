@@ -57,6 +57,8 @@ pub struct HadesApp {
     orchestrator: hades_agent::AgentOrchestrator,
     browser_manager: Arc<hades_browser::BrowserManager>,
     notification_service: NotificationService,
+    smart_orchestrator: crate::orchestration::SmartContextOrchestrator,
+    last_request_plan: Option<crate::orchestration::RequestPlan>,
     version: &'static str,
 }
 
@@ -123,6 +125,8 @@ impl HadesApp {
             orchestrator,
             browser_manager,
             notification_service,
+            smart_orchestrator: crate::orchestration::SmartContextOrchestrator::new(),
+            last_request_plan: None,
             version: APP_VERSION,
         }
     }
@@ -262,6 +266,7 @@ impl HadesApp {
                         .set_active_session_id(&session.metadata.id)
                         .await;
                     self.active_session = Some(session);
+                    self.start_configured_mcp_servers().await;
                     return Ok(warning);
                 }
                 _ => {
@@ -282,6 +287,7 @@ impl HadesApp {
                         &new_session.metadata.title,
                     ));
                     self.active_session = Some(new_session);
+                    self.start_configured_mcp_servers().await;
 
                     return Ok(Some(format!(
                         "Hades could not find session: {session_id}. Use /sessions to view available sessions."
@@ -308,12 +314,20 @@ impl HadesApp {
         ));
         self.active_session = Some(new_session);
 
-        // Auto-start and synchronize configured MCP servers
-        self.mcp_manager.load_from_config(&self.config.mcp).await;
-        self.mcp_manager.auto_start_servers().await;
-        self.sync_mcp_tools().await;
+        self.start_configured_mcp_servers().await;
 
         Ok(None)
+    }
+
+    async fn start_configured_mcp_servers(&mut self) {
+        self.mcp_manager.load_from_config(&self.config.mcp).await;
+        for name in self.mcp_manager.auto_start_server_names().await {
+            info!(server = %name, "Auto-starting MCP server");
+            if let Err(error) = self.start_mcp_server(&name).await {
+                tracing::error!(server = %name, error = %error, "Failed to auto-start MCP server");
+            }
+        }
+        self.sync_mcp_tools().await;
     }
 
     /// Returns current application state.
@@ -379,6 +393,47 @@ impl HadesApp {
     /// Returns the credential backend reference.
     pub fn credential_backend(&self) -> &Arc<dyn CredentialBackend> {
         &self.credential_backend
+    }
+
+    fn mcp_credential_id(server_name: &str) -> String {
+        format!("mcp:{server_name}")
+    }
+
+    /// Stores an optional MCP server authentication token outside of configuration.
+    pub async fn store_mcp_auth_token(
+        &self,
+        server_name: &str,
+        token: Option<&str>,
+    ) -> Result<(), CoreError> {
+        if let Some(token) = token {
+            let credential = Credential::with_api_key(Self::mcp_credential_id(server_name), token);
+            self.credential_backend
+                .store_credential(&credential)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Retrieves an MCP server authentication token, if one is stored.
+    pub async fn mcp_auth_token(&self, server_name: &str) -> Result<Option<String>, CoreError> {
+        let credential = self
+            .credential_backend
+            .get_credential(&Self::mcp_credential_id(server_name))
+            .await?;
+        Ok(credential.and_then(|credential| {
+            credential
+                .api_key
+                .as_ref()
+                .map(|secret| secret.expose_secret().to_string())
+        }))
+    }
+
+    /// Deletes the stored authentication token for an MCP server.
+    pub async fn delete_mcp_auth_token(&self, server_name: &str) -> Result<bool, CoreError> {
+        Ok(self
+            .credential_backend
+            .delete_credential(&Self::mcp_credential_id(server_name))
+            .await?)
     }
 
     /// Returns human-readable representation of the currently active model.
@@ -464,6 +519,23 @@ impl HadesApp {
         self.browser_manager.clone()
     }
 
+    /// Returns the last smart orchestration request plan, if available.
+    pub fn last_request_plan(&self) -> Option<&crate::orchestration::RequestPlan> {
+        self.last_request_plan.as_ref()
+    }
+
+    /// Accessor for the smart context and tool orchestrator.
+    pub fn smart_orchestrator(&self) -> &crate::orchestration::SmartContextOrchestrator {
+        &self.smart_orchestrator
+    }
+
+    /// Mutable accessor for the smart context and tool orchestrator.
+    pub fn smart_orchestrator_mut(
+        &mut self,
+    ) -> &mut crate::orchestration::SmartContextOrchestrator {
+        &mut self.smart_orchestrator
+    }
+
     /// Synchronizes discovered MCP tools from active servers into the core tool registry.
     pub async fn sync_mcp_tools(&mut self) -> usize {
         let mcp_tools = self.mcp_manager.discover_all_tools().await;
@@ -477,12 +549,16 @@ impl HadesApp {
 
     /// Connects to a named MCP server and synchronizes its tools into Hades.
     pub async fn connect_mcp_server(&mut self, server_name: &str) -> Result<(), CoreError> {
-        self.mcp_manager
-            .start_server(server_name)
-            .await
-            .map_err(|e| CoreError::Runtime(e.to_string()))?;
+        self.start_mcp_server(server_name).await?;
         self.sync_mcp_tools().await;
         Ok(())
+    }
+
+    /// Resets the tool registry with all native built-in tools (29 core + 22 browser tools).
+    pub fn reset_native_tools(&mut self) {
+        let mut registry = ToolRegistry::default_registry();
+        hades_browser::BrowserToolSet::register_all(&mut registry, self.browser_manager.clone());
+        self.tool_registry = registry;
     }
 
     /// Disconnects a named MCP server and refreshes the tool registry.
@@ -491,8 +567,8 @@ impl HadesApp {
             .stop_server(server_name)
             .await
             .map_err(|e| CoreError::Runtime(e.to_string()))?;
-        // Reset to default native tools + remaining MCP tools
-        self.tool_registry = ToolRegistry::default_registry();
+        // Reset to default native tools (29 core + 22 browser) + remaining MCP tools
+        self.reset_native_tools();
         self.sync_mcp_tools().await;
         Ok(())
     }
@@ -500,6 +576,139 @@ impl HadesApp {
     /// Returns the pending tool approval request, if any.
     pub fn pending_approval(&self) -> Option<&PendingApproval> {
         self.pending_approval.as_ref()
+    }
+
+    /// Adds a new MCP server to the configuration and persists it.
+    pub async fn add_mcp_server(
+        &mut self,
+        name: &str,
+        transport: &str,
+        command_or_url: &str,
+        args: &str,
+        token_env: &str,
+        auth_token: Option<&str>,
+    ) -> Result<(), CoreError> {
+        use hades_config::model::{McpServerConfig, McpTransportType};
+
+        let transport_type = match transport.to_lowercase().as_str() {
+            "http" => McpTransportType::Http,
+            _ => McpTransportType::Stdio,
+        };
+
+        let mut server_config = McpServerConfig {
+            transport: transport_type,
+            enabled: true,
+            auto_start: true,
+            timeout_secs: 30,
+            ..Default::default()
+        };
+
+        match server_config.transport {
+            McpTransportType::Stdio => {
+                server_config.command = Some(command_or_url.to_string());
+                if !args.is_empty() {
+                    server_config.args = args.split_whitespace().map(str::to_string).collect();
+                }
+            }
+            McpTransportType::Http | McpTransportType::Sse => {
+                server_config.url = Some(command_or_url.to_string());
+            }
+        }
+
+        if !token_env.is_empty() {
+            server_config.token_env = Some(token_env.to_string());
+        }
+
+        self.store_mcp_auth_token(name, auth_token.filter(|token| !token.trim().is_empty()))
+            .await?;
+
+        self.config
+            .mcp
+            .servers
+            .insert(name.to_string(), server_config.clone());
+        self.config_service
+            .save(&self.config)
+            .map_err(|e| CoreError::Runtime(format!("Failed to save config: {e}")))?;
+        self.event_bus
+            .publish(HadesEvent::config_saved(self.config_service.config_path()));
+
+        self.mcp_manager
+            .upsert_server_config(name, server_config)
+            .await;
+
+        if let Err(e) = self.start_mcp_server(name).await {
+            tracing::warn!("Failed to start MCP server '{}': {}", name, e);
+        } else {
+            self.sync_mcp_tools().await;
+        }
+
+        Ok(())
+    }
+
+    /// Removes an MCP server from the configuration and disconnects it.
+    pub async fn remove_mcp_server(&mut self, name: &str) -> Result<(), CoreError> {
+        if let Err(e) = self.mcp_manager.stop_server(name).await {
+            tracing::warn!("Failed to stop MCP server '{}': {}", name, e);
+        }
+
+        self.config.mcp.servers.remove(name);
+        self.config_service
+            .save(&self.config)
+            .map_err(|e| CoreError::Runtime(format!("Failed to save config: {e}")))?;
+        self.event_bus
+            .publish(HadesEvent::config_saved(self.config_service.config_path()));
+
+        self.mcp_manager.remove_server_config(name).await;
+        self.delete_mcp_auth_token(name).await?;
+
+        self.reset_native_tools();
+        self.sync_mcp_tools().await;
+        Ok(())
+    }
+
+    /// Tests the connection to an MCP server and reports its status.
+    pub async fn test_mcp_server(&mut self, name: &str) -> Result<String, CoreError> {
+        if let Err(e) = self.start_mcp_server(name).await {
+            return Ok(format!(
+                "✗ Failed to connect to MCP server '{}': {}",
+                name, e
+            ));
+        }
+
+        let summaries = self.mcp_manager.list_server_summaries().await;
+        if let Some(summary) = summaries.iter().find(|s| s.name == name) {
+            let status = match &summary.state {
+                hades_mcp::McpServerState::Ready => "✓ Ready",
+                hades_mcp::McpServerState::Connected => "✓ Connected",
+                hades_mcp::McpServerState::Starting => "⟳ Starting",
+                hades_mcp::McpServerState::Configured => "○ Configured (not started)",
+                hades_mcp::McpServerState::Disconnected => "✗ Disconnected",
+                hades_mcp::McpServerState::Failed(err) => return Ok(format!("✗ Failed: {err}")),
+                hades_mcp::McpServerState::Stopping => "⟳ Stopping",
+                hades_mcp::McpServerState::Stopped => "✗ Stopped",
+            };
+
+            let mut output = format!("MCP Server Test: {name}\n\n");
+            output.push_str(&format!("Status:    {status}\n"));
+            output.push_str(&format!("Transport: {}\n", summary.transport));
+            output.push_str(&format!("Tools:     {}\n", summary.tool_count));
+            output.push_str(&format!("Resources: {}\n", summary.resource_count));
+            if let Some(error) = &summary.error {
+                output.push_str(&format!("Error:     {error}\n"));
+            }
+            Ok(output)
+        } else {
+            Ok(format!("✗ MCP server '{name}' not found in summaries"))
+        }
+    }
+
+    async fn start_mcp_server(&self, name: &str) -> Result<(), CoreError> {
+        let auth_token = self.mcp_auth_token(name).await?;
+        self.mcp_manager
+            .start_server(name, auth_token.as_deref())
+            .await
+            .map(|_| ())
+            .map_err(|error| CoreError::Runtime(error.to_string()))
     }
 
     /// Sets or clears the pending tool approval request.
@@ -710,6 +919,9 @@ impl HadesApp {
         let result = tool
             .execute(&call.id, call.arguments.clone(), &context)
             .await;
+
+        self.smart_orchestrator
+            .record_tool_execution(&call.tool_name);
 
         match result.status {
             ToolStatus::Success => {
@@ -1252,26 +1464,25 @@ impl HadesApp {
             let _ = self.session_repository.save_session(session).await;
         }
 
-        // 2. Build model-aware context with safe truncation
-        let system_prompt = self.build_system_prompt();
+        // 2. Orchestrate minimal context and tool capabilities
         let history = self
             .active_session
             .as_ref()
             .map(|s| s.messages.as_slice())
             .unwrap_or(&[]);
-        let (messages, report) =
-            self.context_manager
-                .build_context(history, &model_id, Some(&system_prompt), prompt)?;
 
-        if report.was_truncated {
-            self.event_bus.publish(HadesEvent::ContextTruncated {
-                timestamp: chrono::Utc::now(),
-                session_id: session_id.clone(),
-                total_messages: report.total_messages,
-                included_messages: report.included_messages,
-                estimated_tokens: report.estimated_input_tokens,
-            });
-        }
+        let tool_defs = self.tool_registry.list();
+        let active_mcp_servers = self.mcp_manager.active_server_names().await;
+        let orch = self.smart_orchestrator.orchestrate(
+            prompt,
+            history,
+            &tool_defs,
+            &active_mcp_servers,
+            &provider_id,
+            &model_id,
+            &self.workspace_info,
+        );
+        self.last_request_plan = Some(orch.plan.clone());
 
         let credential = self
             .credential_backend
@@ -1285,9 +1496,38 @@ impl HadesApp {
             model_id: model_id.clone(),
         });
 
-        let tools = self.provider_tool_definitions();
-        let mut request = CompletionRequest::single_prompt(&model_id, prompt).with_tools(tools);
-        request.messages = messages;
+        let mut request = CompletionRequest::single_prompt(&model_id, prompt);
+        if !orch.tools.is_empty() {
+            request = request.with_tools(orch.tools);
+        }
+        request.messages = orch.messages;
+
+        // Calculate bounded max_tokens to strictly respect TPM limits and prevent rate limiter overestimation
+        let allowed_output = if let Some(tpm) = orch.plan.provider_tpm_limit {
+            let rem = tpm.saturating_sub(orch.plan.estimated_total_tokens);
+            orch.plan.max_tokens_reserve.min(rem).max(256)
+        } else {
+            orch.plan.max_tokens_reserve
+        };
+        request.max_tokens = Some(allowed_output as u32);
+
+        let serialized_bytes = serde_json::to_vec(&request).map(|b| b.len()).unwrap_or(0);
+        if let Some(ref mut p) = self.last_request_plan {
+            p.max_tokens_reserve = allowed_output;
+            p.serialized_request_bytes = serialized_bytes;
+        }
+
+        tracing::info!(
+            target: "orchestrator",
+            provider = %provider_id,
+            model = %model_id,
+            messages = request.messages.len(),
+            tools = request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            max_tokens = allowed_output,
+            serialized_bytes = serialized_bytes,
+            tpm_limit = ?orch.plan.provider_tpm_limit,
+            "Dispatched model completion request"
+        );
 
         let response = match self.model_manager.complete(request, &credential).await {
             Ok(resp) => resp,
@@ -1372,16 +1612,34 @@ impl HadesApp {
             let _ = self.session_repository.save_session(session).await;
         }
 
-        // 2. Build model-aware context with safe truncation
-        let system_prompt = self.build_system_prompt();
+        // 2. Orchestrate minimal context and tool capabilities
         let history = self
             .active_session
             .as_ref()
             .map(|s| s.messages.as_slice())
             .unwrap_or(&[]);
-        let (messages, report) =
-            self.context_manager
-                .build_context(history, &model_id, Some(&system_prompt), prompt)?;
+
+        let tool_defs = self.tool_registry.list();
+        let active_mcp_servers = self.mcp_manager.active_server_names().await;
+        let orch = self.smart_orchestrator.orchestrate(
+            prompt,
+            history,
+            &tool_defs,
+            &active_mcp_servers,
+            &provider_id,
+            &model_id,
+            &self.workspace_info,
+        );
+        self.last_request_plan = Some(orch.plan.clone());
+
+        let report = ContextReport {
+            total_messages: history.len(),
+            included_messages: orch.messages.len(),
+            estimated_input_tokens: orch.plan.estimated_total_tokens,
+            context_limit: orch.plan.token_budget,
+            output_reserve: 1500,
+            was_truncated: orch.plan.excluded_tools_count > 0,
+        };
 
         if report.was_truncated {
             self.event_bus.publish(HadesEvent::ContextTruncated {
@@ -1405,11 +1663,38 @@ impl HadesApp {
             model_id: model_id.clone(),
         });
 
-        let tools = self.provider_tool_definitions();
-        let mut request = CompletionRequest::single_prompt(&model_id, prompt)
-            .with_stream(true)
-            .with_tools(tools);
-        request.messages = messages;
+        let mut request = CompletionRequest::single_prompt(&model_id, prompt).with_stream(true);
+        if !orch.tools.is_empty() {
+            request = request.with_tools(orch.tools);
+        }
+        request.messages = orch.messages;
+
+        // Calculate bounded max_tokens to strictly respect TPM limits and prevent rate limiter overestimation
+        let allowed_output = if let Some(tpm) = orch.plan.provider_tpm_limit {
+            let rem = tpm.saturating_sub(orch.plan.estimated_total_tokens);
+            orch.plan.max_tokens_reserve.min(rem).max(256)
+        } else {
+            orch.plan.max_tokens_reserve
+        };
+        request.max_tokens = Some(allowed_output as u32);
+
+        let serialized_bytes = serde_json::to_vec(&request).map(|b| b.len()).unwrap_or(0);
+        if let Some(ref mut p) = self.last_request_plan {
+            p.max_tokens_reserve = allowed_output;
+            p.serialized_request_bytes = serialized_bytes;
+        }
+
+        tracing::info!(
+            target: "orchestrator",
+            provider = %provider_id,
+            model = %model_id,
+            messages = request.messages.len(),
+            tools = request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            max_tokens = allowed_output,
+            serialized_bytes = serialized_bytes,
+            tpm_limit = ?orch.plan.provider_tpm_limit,
+            "Dispatched model streaming request"
+        );
 
         let stream = match self
             .model_manager
@@ -1463,15 +1748,32 @@ impl HadesApp {
             .map(|s| s.metadata.id.clone())
             .unwrap_or_else(|| "default".to_string());
 
-        let system_prompt = self.build_system_prompt();
         let history = self
             .active_session
             .as_ref()
             .map(|s| s.messages.as_slice())
             .unwrap_or(&[]);
-        let (messages, report) =
-            self.context_manager
-                .build_context(history, &model_id, Some(&system_prompt), "")?;
+
+        let tool_defs = self.tool_registry.list();
+        let active_mcp_servers = self.mcp_manager.active_server_names().await;
+        let orch = self.smart_orchestrator.orchestrate_continuation(
+            history,
+            &tool_defs,
+            &active_mcp_servers,
+            &provider_id,
+            &model_id,
+            &self.workspace_info,
+        );
+        self.last_request_plan = Some(orch.plan.clone());
+
+        let report = ContextReport {
+            total_messages: history.len(),
+            included_messages: orch.messages.len(),
+            estimated_input_tokens: orch.plan.estimated_total_tokens,
+            context_limit: orch.plan.token_budget,
+            output_reserve: 1500,
+            was_truncated: false,
+        };
 
         let credential = self
             .credential_backend
@@ -1485,11 +1787,38 @@ impl HadesApp {
             model_id: model_id.clone(),
         });
 
-        let tools = self.provider_tool_definitions();
-        let mut request = CompletionRequest::single_prompt(&model_id, "")
-            .with_stream(true)
-            .with_tools(tools);
-        request.messages = messages;
+        let mut request = CompletionRequest::single_prompt(&model_id, "").with_stream(true);
+        if !orch.tools.is_empty() {
+            request = request.with_tools(orch.tools);
+        }
+        request.messages = orch.messages;
+
+        // Calculate bounded max_tokens to strictly respect TPM limits and prevent rate limiter overestimation
+        let allowed_output = if let Some(tpm) = orch.plan.provider_tpm_limit {
+            let rem = tpm.saturating_sub(orch.plan.estimated_total_tokens);
+            orch.plan.max_tokens_reserve.min(rem).max(256)
+        } else {
+            orch.plan.max_tokens_reserve
+        };
+        request.max_tokens = Some(allowed_output as u32);
+
+        let serialized_bytes = serde_json::to_vec(&request).map(|b| b.len()).unwrap_or(0);
+        if let Some(ref mut p) = self.last_request_plan {
+            p.max_tokens_reserve = allowed_output;
+            p.serialized_request_bytes = serialized_bytes;
+        }
+
+        tracing::info!(
+            target: "orchestrator",
+            provider = %provider_id,
+            model = %model_id,
+            messages = request.messages.len(),
+            tools = request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            max_tokens = allowed_output,
+            serialized_bytes = serialized_bytes,
+            tpm_limit = ?orch.plan.provider_tpm_limit,
+            "Dispatched continuation streaming request"
+        );
 
         let stream = match self
             .model_manager
@@ -1638,6 +1967,7 @@ impl HadesApp {
                 let transport_str = match cfg.transport {
                     hades_config::McpTransportType::Stdio => "stdio".to_string(),
                     hades_config::McpTransportType::Http => "http".to_string(),
+                    hades_config::McpTransportType::Sse => "sse".to_string(),
                 };
                 let tool_count = self
                     .tool_registry
@@ -1687,6 +2017,7 @@ impl HadesApp {
         .with_mcp_summaries(mcp_summaries)
         .with_browser(browser_status, Some(self.browser_manager.clone()))
         .with_active_session(self.active_session.as_ref())
+        .with_request_plan(self.last_request_plan.clone())
         .with_raw_input(input);
 
         let result = self.command_registry.execute(input, &mut context);
@@ -1708,6 +2039,13 @@ impl HadesApp {
                     || matches!(output, CommandOutput::OpenSessionPicker)
                 {
                     self.transition_to(AppState::SessionSelect)?;
+                } else if matches!(output, CommandOutput::OpenMcpSetup) {
+                    self.transition_to(AppState::McpSetup)?;
+                } else if matches!(
+                    output,
+                    CommandOutput::RemoveMcpServer(_) | CommandOutput::TestMcpServer(_)
+                ) {
+                    // Will be handled asynchronously in the runner
                 } else if context.shutdown_requested || matches!(output, CommandOutput::Exit) {
                     self.request_shutdown(Some("Command exit requested".to_string()))?;
                 } else if let CommandOutput::ImportSuccess(ref record) = output {
