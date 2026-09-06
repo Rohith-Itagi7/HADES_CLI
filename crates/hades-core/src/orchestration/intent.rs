@@ -46,7 +46,7 @@ pub struct ExtractedEntities {
     pub file_paths: Vec<String>,
     /// Referenced repository coordinates (e.g., "PareekshithPalat/HADES_CLI").
     pub repo_names: Vec<String>,
-    /// Referenced URLs (e.g., "https://api.github.com").
+    /// Referenced URLs (e.g., `https://api.github.com`).
     pub urls: Vec<String>,
     /// Explicit tool names (e.g., "github.list_issues", "filesystem.read").
     pub explicit_tools: Vec<String>,
